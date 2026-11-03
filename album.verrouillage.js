@@ -1,12 +1,15 @@
 // ==UserScript==
 // @name         [test]Wiki-Pick verrouillage (tiroir d'export)
 // @namespace    local.wikipick.lock
-// @version      2.12
+// @version      2.13
 // @description  Verrouille ou déverrouille les cartes d'étiquettes, ou une à une, depuis le tiroir d'export d'Album+cleaner
 // @match        https://wiki-pick.com/*
 // @grant        none
 // @run-at       document-idle
 // @noframes
+// @homepageURL  https://github.com/Zarissa92/wiki-pick.com-addons
+// @updateURL    https://raw.githubusercontent.com/Zarissa92/wiki-pick.com-addons/main/album.verrouillage.js
+// @downloadURL  https://raw.githubusercontent.com/Zarissa92/wiki-pick.com-addons/main/album.verrouillage.js
 // ==/UserScript==
 
 (function () {
