@@ -1,6 +1,6 @@
 # Album+cleaner — outils pour wiki-pick.com
 
-Trois userscripts que j'ai faits pour jouer à [wiki-pick.com](https://wiki-pick.com) plus confortablement : un site plus lisible, des exports de mes étiquettes, le partage de mes paquets sur Discord et le verrouillage de mes cartes en masse.
+Trois userscripts, pour jouer à [wiki-pick.com](https://wiki-pick.com) plus confortablement : un site plus lisible, des exports de mes étiquettes, le partage de mes paquets sur Discord et le verrouillage de mes cartes en masse.
 
 Tout tourne dans le navigateur. Le site n'est pas modifié, il n'y a pas de serveur à moi derrière, et les réglages restent dans le `localStorage` du navigateur.
 
