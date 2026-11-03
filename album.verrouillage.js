@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         [test]Wiki-Pick verrouillage (tiroir d'export)
 // @namespace    local.wikipick.lock
-// @version      2.10
+// @version      2.12
 // @description  Verrouille ou déverrouille les cartes d'étiquettes, ou une à une, depuis le tiroir d'export d'Album+cleaner
 // @match        https://wiki-pick.com/*
 // @grant        none
@@ -15,16 +15,16 @@
   // ===== PARAMÈTRES MODIFIABLES =====
   // (2.8) verrouillages : un seul à la fois, et ce délai entre la fin de l'un et le départ du suivant.
   // Les lectures des copies, elles, restent rapides (LECTURES_SIMULTANEES en parallèle, sans délai).
-  const DELAI_ENTRE_VERROUILLAGES_MS = 1000;
+  const DELAI_ENTRE_VERROUILLAGES_MS = 900;
   const CONFIRMATION_A_PARTIR_DE = 10;       // demande confirmation au-delà de ce nombre de cartes
-  const TAILLE_LOT = 98;                    // cartes traitées par lot
+  const TAILLE_LOT = 100;                    // cartes traitées par lot
   const LECTURES_SIMULTANEES = 4;            // lectures de la collection en parallèle, dans un bloc
   const LECTURES_PAR_BLOC = 50;              // (2.9) les copies sont lues par blocs de 50 cartes…
-  const PAUSE_ENTRE_BLOCS_LECTURE_MS = 2000; // … avec cette pause entre deux blocs
+  const PAUSE_ENTRE_BLOCS_LECTURE_MS = 1500; // … avec cette pause entre deux blocs
   // (2.10) quand le site répond 429 (« trop de requêtes ») : toutes les requêtes de l'outil s'arrêtent le temps demandé
   // par le site (en-tête Retry-After), sinon ATTENTE_429_MS, doublée à chaque nouveau refus, puis la même requête repart
   const REESSAIS_429 = 5;                    // nouveaux essais au plus pour une même requête
-  const ATTENTE_429_MS = 10000;               // première attente si le site ne dit pas combien
+  const ATTENTE_429_MS = 5000;               // première attente si le site ne dit pas combien
   const ATTENTE_429_MAX_MS = 120000;         // jamais plus de 2 min d'un coup
   const PAUSE_ENTRE_LOTS_MS = 2000;          // pause entre deux lots
   const URL_SITE = "https://wiki-pick.com";
@@ -685,14 +685,11 @@
     const res = $(".wpx-t-res", t);
     if (!seg || !res) return;
 
-    const mode = h("button", { type: "button", class: "wpx-vr-mode", "aria-pressed": "false", title: "Verrouiller ou déverrouiller les cartes des étiquettes cochées" },
-      SVG_FERME, h("span", null, "Verrouiller"));
-    seg.append(mode);
-    mode.addEventListener("click", () => basculerMode(!t.classList.contains("wpx-vr-on")));
+    // (2.12) pas de bouton « Verrouiller » dans le tiroir : on y entre par le cadenas du haut du site. Un clic sur
+    // « Exporter les étiquettes » ou « Extraire les cartes » ramène le tiroir à l'export.
     seg.addEventListener("click", e => {
       if (e.target.closest("[data-mode]")) basculerMode(false);
     });
-    ETAT.mode = mode;
 
     ETAT.journal = h("div", { class: "wpx-vr-journal", "aria-live": "polite" });
     ETAT.resume = h("span", { class: "wpx-vr-resume" });
@@ -726,24 +723,42 @@
     majBoutonsJournal();
   }
 
-  function basculerMode(on) {
-    const t = $("#wpx-tiroir");
-    if (!t || !ETAT.mode) return;
-    if (on && !t.querySelector(".wpx-vr-panel")) installerDansTiroir(t);
-    t.classList.toggle("wpx-vr-on", on);
-    ETAT.mode.setAttribute("aria-pressed", String(on));
-    if (on) {
-      $$("[data-mode]", $(".wpx-seg", t)).forEach(b => b.setAttribute("aria-pressed", "false"));
-      rafraichirPanneau();
-    }
+  // le mode d'export qu'Album avait (« liste » ou « cartes »), pour rallumer son bouton en sortant du verrouillage
+  function modeAlbum() {
+    try { return JSON.parse(localStorage.getItem("wpx.export.mode")) === "cartes" ? "cartes" : "liste"; }
+    catch (e) { return "liste"; }
   }
 
-  // ---------- Bouton à côté de Clean et Largeur ----------
+  function basculerMode(on) {
+    const t = $("#wpx-tiroir");
+    if (!t) return;
+    if (on && !t.querySelector(".wpx-vr-panel")) installerDansTiroir(t);
+    t.classList.toggle("wpx-vr-on", on);
+    if (ETAT.bouton) ETAT.bouton.setAttribute("aria-pressed", String(on));
+    const seg = $(".wpx-seg", t);
+    if (seg) {
+      const garder = on ? null : modeAlbum();
+      $$("[data-mode]", seg).forEach(b => b.setAttribute("aria-pressed", String(b.dataset.mode === garder)));
+    }
+    if (on) rafraichirPanneau();
+  }
+
+  // ---------- Le cadenas, en haut du site (à côté de Clean et Largeur) : seul accès au verrouillage ----------
+  // Un clic ouvre le tiroir directement en mode verrouillage ; un second clic le referme.
   function ouvrirVerrou() {
     let t = $("#wpx-tiroir");
-    if (t && t.classList.contains("wpx-ouvert")) return basculerMode(!t.classList.contains("wpx-vr-on"));
+    if (t && t.classList.contains("wpx-ouvert")) {
+      if (t.classList.contains("wpx-vr-on")) {
+        const fermer = $(".wpx-t-tete .wpx-x", t);
+        if (fermer) fermer.click();
+        else basculerMode(false);
+      } else {
+        basculerMode(true);
+      }
+      return;
+    }
     const exp = $$(".wpx-exports button").find(b => b.getClientRects().length);
-    if (!exp) return toast("Ouvre une étiquette (profil ou Ma collection > Étiquettes) : le tiroir d'export s'ouvre depuis là.");
+    if (!exp) return toast("Va sur une page d'étiquettes (un profil, ou Ma collection > Étiquettes) : le verrouillage part des étiquettes affichées.");
     exp.click();
     t = $("#wpx-tiroir");
     if (t) basculerMode(true);
@@ -756,8 +771,8 @@
     const existant = rangee.querySelector(".wpx-vr-crane");
     if (existant) { ETAT.bouton = existant; return; }
     const repere = rangee.querySelector(":scope > [data-wpx-reglages]") || rangee.querySelector(":scope > [data-wpx-bascule]");
-    const bouton = h("button", { type: "button", class: "wpx-crane wpx-vr-crane", title: "Verrouiller les cartes (ouvre le tiroir d'export)",
-      "aria-label": "Verrouiller les cartes", onclick: ouvrirVerrou }, SVG_FERME);
+    const bouton = h("button", { type: "button", class: "wpx-crane wpx-vr-crane", "aria-pressed": "false",
+      title: "Verrouiller ou déverrouiller les cartes des étiquettes affichées", "aria-label": "Verrouiller les cartes", onclick: ouvrirVerrou }, SVG_FERME);
     if (repere) repere.after(bouton);
     else rangee.append(bouton);
     ETAT.bouton = bouton;
@@ -847,7 +862,7 @@
     if (ETAT.dedans && !dedans) {
       if (t.classList.contains("wpx-vr-on")) {               // tiroir fermé en mode verrouillage : il rouvrira sur l'export
         t.classList.remove("wpx-vr-on");
-        if (ETAT.mode) ETAT.mode.setAttribute("aria-pressed", "false");
+        if (ETAT.bouton) ETAT.bouton.setAttribute("aria-pressed", "false");
       }
       ETAT.dedans = false;
       viderEnQuittant();

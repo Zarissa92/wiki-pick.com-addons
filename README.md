@@ -8,7 +8,7 @@ Tout tourne dans le navigateur. Le site n'est pas modifié, il n'y a pas de serv
 |---|---|---|---|
 | **Album+cleaner+Maximisation** | `album.user.js` | 12.23 | Le script principal : affichage, exports, derniers paquets, historique, Discord |
 | **Album pont Discord** | `album_pont_discord.user.js` | 1.6 | Petit relais qui envoie vers Discord les messages préparés par Album |
-| **Wiki-Pick verrouillage** | `wikipick_verrouillage.user.js` | 2.10 | Verrouille ou déverrouille des cartes par étiquettes, depuis le tiroir d'export d'Album |
+| **Wiki-Pick verrouillage** | `wikipick_verrouillage.user.js` | 2.12 | Verrouille ou déverrouille des cartes par étiquettes, depuis le tiroir d'export d'Album |
 
 Album marche tout seul. Le pont ne sert que si on utilise le partage Discord. Le verrouillage a besoin d'Album, parce qu'il se branche dans son tiroir d'export.
 
@@ -100,7 +100,7 @@ Les envois passent par une file gardée dans le navigateur, un seul onglet à la
 
 ## Verrouillage
 
-Ajoute un mode **Verrouiller** dans le tiroir d'export d'Album, et un bouton cadenas à côté de Clean et Largeur. On coche des étiquettes, puis on verrouille ou déverrouille :
+Ajoute un bouton **cadenas** en haut du site, à côté de Clean et Largeur. Sur une page d'étiquettes (un profil, ou Ma collection › Étiquettes), il ouvre directement le panneau de verrouillage ; un second clic le referme. On coche des étiquettes, puis on verrouille ou déverrouille :
 - toute la sélection ;
 - une étiquette ;
 - ou une carte à la fois.
