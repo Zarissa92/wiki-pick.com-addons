@@ -1,6 +1,6 @@
 # Wiki-Pick — addons
 
-Des userscripts faits pour jouer à [wiki-pick.com](https://wiki-pick.com) plus confortablement : un site plus lisible, des exports de mes étiquettes, le verrouillage de mes cartes en masse et le masquage des vendeurs que j'ai bloqués.
+Des userscripts que j'ai faits pour jouer à [wiki-pick.com](https://wiki-pick.com) plus confortablement : un site plus lisible, des exports de mes étiquettes, le verrouillage de mes cartes en masse, le masquage des vendeurs que j'ai bloqués et le tri de ma collection par date d'ajout.
 
 Tout tourne dans le navigateur. Le site n'est pas modifié, il n'y a pas de serveur à moi derrière, et les réglages restent dans le `localStorage` du navigateur.
 
@@ -8,15 +8,16 @@ Tout tourne dans le navigateur. Le site n'est pas modifié, il n'y a pas de serv
 |---|---|---|---|
 | **Album+cleaner+Maximisation** | `album.user.js` | 12.23 | Le script principal : affichage, exports, derniers paquets, historique, échanges |
 | **Wiki-Pick verrouillage** | `album.verrouillage.js` | 2.16 | Verrouille ou déverrouille des cartes par étiquettes, depuis le tiroir d'export d'Album |
-| **Wiki-Pick vendeurs bloqués** | `vendeurs_bloques.user.js` | 1.3 | Masque les annonces des vendeurs que j'ai bloqués sur le site |
+| **Wiki-Pick vendeurs bloqués** | `vendeurs_bloques.user.js` | 1.5 | Masque les annonces des vendeurs que j'ai bloqués sur le site, avec un bouton pour l'activer ou le désactiver |
+| **Wiki-Pick tri par date d'ajout** | `wikipick_tri_date.user.js` | 0.5 | Trie les cartes de la page « Ma collection » par date d'obtention |
 
-Album marche tout seul. Le verrouillage a besoin d'Album, parce qu'il se branche dans son tiroir d'export. Le masquage des vendeurs est indépendant.
+Album marche tout seul. Le verrouillage a besoin d'Album, parce qu'il se branche dans son tiroir d'export. Le masquage des vendeurs et le tri par date sont indépendants.
 
 ---
 
 ## Installation
 
-1. Installer un gestionnaire de userscripts : [Tampermonkey](https://www.tampermonkey.net/), [Violentmonkey](https://violentmonkey.github.io/) ou Greasemonkey FTW (Firefox).
+1. Installer un gestionnaire de userscripts : [Tampermonkey](https://www.tampermonkey.net/), [Violentmonkey](https://violentmonkey.github.io/) ou Greasemonkey (Firefox).
 2. Créer un nouveau script et y coller le contenu du fichier, pour chacun des scripts voulus. Ou ouvrir le fichier brut sur GitHub et l'installer directement depuis le gestionnaire.
 3. Recharger wiki-pick.com.
 
@@ -109,17 +110,33 @@ Masque les annonces des vendeurs que j'ai bloqués sur le site. La liste des blo
 - La liste est relue à chaque chargement d'annonces (pas en continu, donc aucune requête de plus quand je ne regarde pas le marché).
 - Les annonces sont retirées des réponses du site avant affichage : ça marche sur tous les tris et filtres, pas seulement sur la page par défaut.
 - La comparaison ignore la casse, les espaces et les accents.
+- Un bouton **Blocage** à côté de **Messages** permet d'activer ou de désactiver le masquage. Le choix est gardé dans le navigateur ; un clic recharge la page.
 
 Limite : si je bloque quelqu'un pendant que la page est ouverte, ses annonces disparaissent au prochain chargement d'annonces (changement de filtre, de tri ou de page).
+
+---
+
+## Wiki-Pick tri par date d'ajout
+
+Ajoute un bouton **Tri par date** à côté de **Sélectionner**, sur la page « Ma collection ». Un clic passe en tri **plus récent d'abord**, un second en **plus ancien d'abord**, un troisième rend l'ordre du site (rareté, puis date d'obtention).
+
+- La date utilisée est celle de l'obtention de l'exemplaire affiché (ou la plus récente de la carte si l'exemplaire n'est pas reconnu).
+- Les dates sont lues sur la fiche de chaque carte, **par blocs de 50 lus en même temps**, avec 1,5 s entre deux blocs. Un 429 du site fait attendre 5 s, puis 10 s, 15 s, avant de réessayer.
+- Les dates sont gardées dans le navigateur : une carte n'est lue qu'une fois.
+- Le mode choisi reste en place quand on change de page. Les cartes d'une nouvelle page sont lues et triées automatiquement.
+
+Limites :
+- Le tri ne porte que sur la page affichée (100 cartes). Trier toute la collection demanderait de lire environ 78 000 fiches.
+- Le tri remplace l'ordre fait à la main avec le glisser-déposer du site. « Remettre à l'emplacement d'origine » le restaure.
 
 ---
 
 ## Données et vie privée
 
 - **Aucun secret dans le code.** Aucune adresse ni aucun identifiant n'est écrit dans les fichiers.
-- Les données gardées (réglages, derniers paquets, historique des échanges, caches) restent dans le navigateur, sous des clés `wpx.*`.
+- Les données gardées (réglages, derniers paquets, historique des échanges, dates de tri, caches) restent dans le navigateur, sous des clés `wpx.*`.
 - Les scripts n'envoient rien à un autre site que wiki-pick.com. Ils lisent l'API du site comme le site lui-même, avec ma session, sans jamais lire les cookies.
-- Le verrouillage et le masquage lisent l'API du site par petits lots espacés : je ne veux pas surcharger le site.
+- Le verrouillage, le masquage et le tri lisent l'API du site par petits lots espacés : je ne veux pas surcharger le site.
 
 ### À savoir
 - Ces scripts utilisent des routes internes du site, qui peuvent changer du jour au lendemain. Le garde-fou est là pour le signaler.
@@ -133,6 +150,7 @@ Limite : si je bloque quelqu'un pendant que la page est ouverte, ses annonces di
 album.user.js                 Album+cleaner+Maximisation
 album.verrouillage.js         Wiki-Pick verrouillage (tiroir d'export)
 vendeurs_bloques.user.js      Wiki-Pick vendeurs bloqués
+wikipick_tri_date.user.js     Wiki-Pick tri par date d'ajout
 README.md
 ```
 
