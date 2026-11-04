@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         [Test] Wiki-Pick tri par date d'ajout
+// @name         Wiki-Pick tri par date d'ajout
 // @namespace    local.wikipick.tridate
-// @version      0.5
-// @description  Ajoute un tri par date d'obtention à « Ma collection » (persiste d'une page à l'autre, lecture par blocs de 50, avec cache)
-// @match        https://wiki-pick.com/collection*
+// @version      0.8
+// @description  Trie les cartes affichées de « Ma collection » par date d'obtention uniquement, dans la grille d'origine (lecture par blocs de 99, avec cache)
+// @match        https://wiki-pick.com/*
 // @grant        none
 // @run-at       document-idle
 // @noframes
@@ -13,18 +13,24 @@
   "use strict";
 
   // ===== PARAMÈTRES MODIFIABLES =====
-  const LECTURES_PAR_BLOC = 50;            // fiches lues en même temps dans un bloc
+  const N_PAR_DEFAUT = 99;                 // nombre de cartes de la page à trier (modifiable à côté du bouton)
+  const N_MIN = 1;
+  const N_MAX = 99;                        // la grille ne peut trier que les cartes de la page affichée
+  const LECTURES_PAR_BLOC = 99;            // fiches lues en même temps dans un bloc
   const PAUSE_ENTRE_BLOCS_MS = 1500;       // pause entre deux blocs
   const PAUSE_SI_429_MS = 5000;            // pause si le site répond « trop de requêtes »
   const ESSAIS_SI_429 = 3;                 // nombre de nouvelles tentatives pour une carte
   const DELAI_AVANT_TRI_MS = 400;          // attente après un redessin de la grille avant de trier
   const CLE_CACHE = "wpx.tri.dates2";      // dates déjà lues, gardées dans le navigateur
   const CLE_MODE = "wpx.tri.mode";         // mode choisi, gardé d'une page à l'autre
+  const CLE_N = "wpx.tri.n";               // nombre de cartes choisi, gardé d'une page à l'autre
   const ID_BOUTON = "wpx-tri-date";
+  const ID_CHAMP = "wpx-tri-n";
   // ===== FIN DES PARAMÈTRES =====
 
   if (window.__wpxTriDate) return;
   window.__wpxTriDate = true;
+  console.log("[tri par date] script chargé");
 
   const MODES = ["site", "recent", "ancien"];
   const LIBELLES = {
@@ -41,6 +47,12 @@
     if (MODES.includes(m)) mode = m;
   } catch (e) { /* stockage indisponible : mode par défaut */ }
 
+  let nCartes = N_PAR_DEFAUT;
+  try {
+    const v = parseInt(localStorage.getItem(CLE_N), 10);
+    if (v >= N_MIN && v <= N_MAX) nCartes = v;
+  } catch (e) { /* valeur par défaut */ }
+
   // { cartes: { cid: { ex: {idExemplaire: ts}, max: ts } } }
   function lireCache() {
     try {
@@ -55,6 +67,9 @@
   }
   function ecrireMode() {
     try { localStorage.setItem(CLE_MODE, mode); } catch (e) { /* ignoré */ }
+  }
+  function ecrireN() {
+    try { localStorage.setItem(CLE_N, String(nCartes)); } catch (e) { /* ignoré */ }
   }
 
   // Les cartes de la grille, chacune dans son conteneur .cw
@@ -95,12 +110,11 @@
     throw new Error("trop de requêtes persistantes sur " + cid);
   }
 
-  // Lit les cartes absentes du cache, par blocs de 50 lus en même temps
+  // Lit les cartes absentes du cache, par blocs de 99 lus en même temps
   async function lireDates(liste, progres) {
     const cache = lireCache();
     const aLire = [...new Set(liste.map(cidDe))].filter(cid => !cache.cartes[cid]);
     if (!aLire.length) return;
-    let fait = 0;
 
     for (let i = 0; i < aLire.length; i += LECTURES_PAR_BLOC) {
       const bloc = aLire.slice(i, i + LECTURES_PAR_BLOC);
@@ -118,9 +132,8 @@
         cache.cartes[bloc[k]] = { ex, max };
       });
 
-      fait += bloc.length;
       ecrireCache(cache);
-      progres(fait, aLire.length);
+      progres(Math.min(i + bloc.length, aLire.length), aLire.length);
 
       if (i + LECTURES_PAR_BLOC < aLire.length) await pause(PAUSE_ENTRE_BLOCS_MS);
     }
@@ -146,33 +159,50 @@
     return actuel.length === cible.length && actuel.every((w, i) => w === cible[i]);
   }
 
+  // Tri par date seule. Pas de date, ou même date : départage par identifiant de carte,
+  // jamais par la rareté (l'ordre du site). Les cartes sans date vont à la fin.
+  function comparerParDate(cache) {
+    return (x, y) => {
+      const dx = dateDe(x, cache), dy = dateDe(y, cache);
+      const cx = cidDe(x), cy = cidDe(y);
+      if (dx === 0 || dy === 0) {
+        if (dx === dy) return cx < cy ? -1 : (cx > cy ? 1 : 0);
+        return dx === 0 ? 1 : -1;
+      }
+      if (dx === dy) return cx < cy ? -1 : (cx > cy ? 1 : 0);
+      return mode === "recent" ? dy - dx : dx - dy;
+    };
+  }
+
   function texte(b, t) {
     if (b && b.textContent !== t) b.textContent = t;
   }
   const bouton = () => document.getElementById(ID_BOUTON);
+  const champ = () => document.getElementById(ID_CHAMP);
 
   let ordreInitial = null;   // ordre tel que le site l'affiche (mode « site »), pour y revenir
   let occupe = false;
   let enAttente = false;
   let minuterie = null;
 
-  // Lit ce qui manque, puis range la grille selon le mode choisi
+  // Lit ce qui manque pour les N premières cartes, puis les range en tête de grille
   async function appliquerAuto() {
     if (mode === "site") return;
     if (occupe) { enAttente = true; return; }
-    const liste = elements();
-    if (!liste.length) return;
+    const toutes = elements();
+    if (!toutes.length) return;
+    const aTrier = toutes.slice(0, nCartes);
+    const reste = toutes.slice(nCartes);
 
     const b = bouton();
     occupe = true;
     if (b) b.disabled = true;
     try {
-      await lireDates(liste, (fait, total) => texte(b, `Lecture des dates ${fait} / ${total}…`));
+      await lireDates(aTrier, (fait, total) => texte(b, `Lecture des dates ${fait} / ${total}…`));
       const cache = lireCache();
-      const cible = liste.slice().sort((x, y) => {
-        const dx = dateDe(x, cache), dy = dateDe(y, cache);
-        return mode === "recent" ? dy - dx : dx - dy;
-      });
+      const sans = aTrier.filter(w => dateDe(w, cache) === 0).length;
+      if (sans) console.log(`[tri par date] ${sans} carte(s) sans date, placées à la fin`);
+      const cible = aTrier.slice().sort(comparerParDate(cache)).concat(reste);
       if (!memeOrdre(cible)) appliquer(cible);
       texte(b, LIBELLES[mode]);
     } catch (e) {
@@ -204,24 +234,55 @@
     appliquerAuto();
   }
 
-  // Le bouton se place juste après « Sélectionner » ; il est remis en place si le site le redessine
+  // Changement du nombre de cartes : on garde la valeur, et on retrie si un tri est actif
+  function changerN() {
+    const c = champ();
+    const v = Math.min(N_MAX, Math.max(N_MIN, parseInt(c.value, 10) || N_PAR_DEFAUT));
+    nCartes = v;
+    c.value = String(v);
+    ecrireN();
+    if (mode !== "site") planifier();
+  }
+
+  // Le bouton se place après « Sélectionner » ; sans cette option, en bas à gauche de l'écran
   function installer() {
     if (bouton()) return;
     const repere = document.getElementById("selBtn");
-    if (!repere) return;
+    if (!repere && !elements().length) return;   // pas de grille de cartes sur cette page
+
     const b = document.createElement("button");
     b.id = ID_BOUTON;
     b.type = "button";
     b.className = "btn ghost";
     b.textContent = LIBELLES[mode];
     b.addEventListener("click", cliquer);
-    repere.insertAdjacentElement("afterend", b);
+
+    const c = document.createElement("input");
+    c.id = ID_CHAMP;
+    c.type = "number";
+    c.min = String(N_MIN);
+    c.max = String(N_MAX);
+    c.value = String(nCartes);
+    c.title = "Nombre de cartes de la page à trier (99 au maximum)";
+    c.style.cssText = "width:70px;margin-left:6px;";
+    c.addEventListener("change", changerN);
+
+    if (repere) {
+      repere.insertAdjacentElement("afterend", b);
+      b.insertAdjacentElement("afterend", c);
+    } else {
+      b.style.cssText = "position:fixed;left:16px;bottom:16px;z-index:9999;";
+      c.style.cssText = "position:fixed;left:170px;bottom:16px;z-index:9999;width:70px;";
+      document.body.appendChild(b);
+      document.body.appendChild(c);
+    }
+    console.log("[tri par date] bouton ajouté");
   }
 
-  // Ignore les changements faits par le bouton lui-même (sinon boucle sans fin)
+  // Ignore les changements faits par le bouton et le champ (sinon boucle sans fin)
   const dansBouton = n => {
     const el = n.nodeType === 1 ? n : n.parentElement;
-    return !!(el && el.closest && el.closest("#" + ID_BOUTON));
+    return !!(el && el.closest && el.closest("#" + ID_BOUTON + ", #" + ID_CHAMP));
   };
 
   installer();
