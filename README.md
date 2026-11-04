@@ -1,6 +1,6 @@
 # Wiki-Pick — addons
 
-Des userscripts que j'ai faits pour jouer à [wiki-pick.com](https://wiki-pick.com) plus confortablement : un site plus lisible, des exports de mes étiquettes, le verrouillage de mes cartes en masse et le masquage des vendeurs que j'ai bloqués.
+Des userscripts faits pour jouer à [wiki-pick.com](https://wiki-pick.com) plus confortablement : un site plus lisible, des exports de mes étiquettes, le verrouillage de mes cartes en masse et le masquage des vendeurs que j'ai bloqués.
 
 Tout tourne dans le navigateur. Le site n'est pas modifié, il n'y a pas de serveur à moi derrière, et les réglages restent dans le `localStorage` du navigateur.
 
@@ -16,7 +16,7 @@ Album marche tout seul. Le verrouillage a besoin d'Album, parce qu'il se branche
 
 ## Installation
 
-1. Installer un gestionnaire de userscripts : [Tampermonkey](https://www.tampermonkey.net/), [Violentmonkey](https://violentmonkey.github.io/) ou Greasemonkey (Firefox).
+1. Installer un gestionnaire de userscripts : [Tampermonkey](https://www.tampermonkey.net/), [Violentmonkey](https://violentmonkey.github.io/) ou Greasemonkey FTW (Firefox).
 2. Créer un nouveau script et y coller le contenu du fichier, pour chacun des scripts voulus. Ou ouvrir le fichier brut sur GitHub et l'installer directement depuis le gestionnaire.
 3. Recharger wiki-pick.com.
 
