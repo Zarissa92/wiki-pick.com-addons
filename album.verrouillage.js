@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         [test]Wiki-Pick verrouillage (tiroir d'export)
 // @namespace    local.wikipick.lock
-// @version      2.13
+// @version      2.14
 // @description  Verrouille ou déverrouille les cartes d'étiquettes, ou une à une, depuis le tiroir d'export d'Album+cleaner
 // @match        https://wiki-pick.com/*
 // @grant        none
@@ -19,6 +19,8 @@
   // (2.8) verrouillages : un seul à la fois, et ce délai entre la fin de l'un et le départ du suivant.
   // Les lectures des copies, elles, restent rapides (LECTURES_SIMULTANEES en parallèle, sans délai).
   const DELAI_ENTRE_VERROUILLAGES_MS = 900;
+  // (2.14) les exemplaires partent en un seul envoi groupé, comme le fait le site, jusqu'à ce nombre par envoi
+  const EXEMPLAIRES_PAR_ENVOI = 25;
   const CONFIRMATION_A_PARTIR_DE = 10;       // demande confirmation au-delà de ce nombre de cartes
   const TAILLE_LOT = 100;                    // cartes traitées par lot
   const LECTURES_SIMULTANEES = 4;            // lectures de la collection en parallèle, dans un bloc
@@ -241,6 +243,20 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ card_id, on }),
     });
+    return res.status;
+  }
+
+  // (2.14) Plusieurs exemplaires d'un coup, comme le site : POST /api/card/lock/bulk {on, ids:[…]}.
+  // Si le site ne connaît pas cette adresse (404, 405), l'outil revient au verrouillage carte par carte pour la session.
+  const GROUPE = { possible: true };
+  async function setVerrouGroupe(ids, on) {
+    const res = await requeteVerrou(URL_SITE + "/api/card/lock/bulk", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ on, ids }),
+    });
+    if (res.status === 404 || res.status === 405) GROUPE.possible = false;
     return res.status;
   }
 
@@ -516,11 +532,11 @@
           setProgres({ fait, total, statut: "En cours", etat: "en", detail: `${libelleLot} · lecture des copies ${lus} / ${nb}` + (note ? ` · ${note}` : "") });
         });
 
-        // 2) écritures, une à une, avec le délai
+        // 2) tri : ce qui est absent ou déjà dans l'état demandé ne part pas au site
+        const aEnvoyer = [];            // {c, etiquette, ids} : les exemplaires à changer, carte par carte
         for (const c of lot) {
           if (RUN.stop) break;
           const etiquette = c.sh ? " (chromatique)" : c.hw ? " (Halloween)" : "";
-          setProgres({ fait, total, statut: "En cours", etat: "en", detail: `${libelleLot} · vérifie : ${c.nom}${etiquette}` });
           try {
             const lecture = copies.get(c.cid);
             if (!lecture || lecture.erreur) throw (lecture && lecture.erreur) || new Error("lecture impossible");
@@ -528,30 +544,90 @@
             if (!liste.length) {
               cartesAbsentes++;
               journal("Pas dans ta collection : " + c.nom + etiquette);
-            } else {
-              // seules les copies qui ne sont pas déjà dans l'état demandé partent au site
-              const cibles = liste.filter(m => m.state === undefined || (on ? !EST_VERROUILLEE(m) : EST_VERROUILLEE(m)));
-              if (!cibles.length) {
-                cartesDeja++;
-                journal(`Déjà ${on ? "verrouillée" : "déverrouillée"} : ${c.nom}${etiquette}`);
-              }
-              let modifiees = 0;
-              for (const m of cibles) {
-                if (RUN.stop) break;
-                const statut = await setVerrou(m.id, on);
-                if (statut >= 200 && statut < 300) { modifiees++; exemplaires++; }
-                else erreurs++;
-                journal(`${statut}  ${c.nom}${etiquette}  (id ${m.id})`);
-                setProgres({ fait, total, statut: "En cours", etat: "en", detail: `${libelleLot} · « ${c.nom} » fait (${DELAI_ENTRE_VERROUILLAGES_MS / 1000} s entre deux verrouillages)` });
-              }
-              if (modifiees) cartesModifiees++;
+              fait++;
+              continue;
             }
+            const cibles = liste.filter(m => m.state === undefined || (on ? !EST_VERROUILLEE(m) : EST_VERROUILLEE(m)));
+            if (!cibles.length) {
+              cartesDeja++;
+              journal(`Déjà ${on ? "verrouillée" : "déverrouillée"} : ${c.nom}${etiquette}`);
+              fait++;
+              continue;
+            }
+            aEnvoyer.push({ c, etiquette, ids: cibles.map(m => m.id) });
           } catch (e) {
             erreurs++;
             journal("Erreur  " + c.nom + " : " + e.message);
+            fait++;
           }
-          fait++;
-          setProgres({ fait, total, statut: "En cours", etat: "en", detail: `${libelleLot} · dernière carte traitée : ${c.nom}` });
+        }
+        setProgres({ fait, total, statut: "En cours", etat: "en", detail: `${libelleLot} · ${pluriel(aEnvoyer.length, "carte")} à ${on ? "verrouiller" : "déverrouiller"}` });
+
+        // 3) envoi par groupes de EXEMPLAIRES_PAR_ENVOI exemplaires (une carte n'est jamais coupée en deux, sauf si elle
+        //    a à elle seule plus d'exemplaires que la taille d'un groupe), DELAI_ENTRE_VERROUILLAGES_MS entre deux envois
+        const groupes = [];
+        let courant = [];
+        let taille = 0;
+        for (const x of aEnvoyer) {
+          if (courant.length && taille + x.ids.length > EXEMPLAIRES_PAR_ENVOI) {
+            groupes.push(courant);
+            courant = [];
+            taille = 0;
+          }
+          courant.push(x);
+          taille += x.ids.length;
+        }
+        if (courant.length) groupes.push(courant);
+
+        for (let gi = 0; gi < groupes.length && !RUN.stop; gi++) {
+          const groupe = groupes[gi];
+          const ids = groupe.flatMap(x => x.ids);
+          setProgres({ fait, total, statut: "En cours", etat: "en",
+            detail: `${libelleLot} · envoi ${gi + 1}/${groupes.length} : ${pluriel(groupe.length, "carte")}, ${pluriel(ids.length, "exemplaire")}` });
+          let reussi = false;
+          if (GROUPE.possible && ids.length > 1) {
+            try {
+              const statut = await setVerrouGroupe(ids, on);
+              reussi = statut >= 200 && statut < 300;
+              journal(`${statut}  envoi groupé de ${pluriel(ids.length, "exemplaire")} (${pluriel(groupe.length, "carte")})`);
+              if (reussi) {
+                for (const x of groupe) journal(`   ${on ? "verrouillée" : "déverrouillée"} : ${x.c.nom}${x.etiquette}  (id ${x.ids.join(", ")})`);
+                cartesModifiees += groupe.length;
+                exemplaires += ids.length;
+              } else if (!GROUPE.possible) {
+                journal("Le site ne connaît pas l'envoi groupé : retour au verrouillage carte par carte.");
+              } else {
+                erreurs++;
+              }
+            } catch (e) {
+              erreurs++;
+              journal("Erreur sur l'envoi groupé : " + e.message);
+            }
+            if (reussi || GROUPE.possible) {
+              fait += groupe.length;
+              continue;
+            }
+          }
+          // carte par carte : un seul exemplaire à changer, ou le site refuse l'envoi groupé
+          for (const x of groupe) {
+            if (RUN.stop) break;
+            let modifiees = 0;
+            for (const id of x.ids) {
+              if (RUN.stop) break;
+              try {
+                const statut = await setVerrou(id, on);
+                if (statut >= 200 && statut < 300) { modifiees++; exemplaires++; }
+                else erreurs++;
+                journal(`${statut}  ${x.c.nom}${x.etiquette}  (id ${id})`);
+              } catch (e) {
+                erreurs++;
+                journal("Erreur  " + x.c.nom + " : " + e.message);
+              }
+            }
+            if (modifiees) cartesModifiees++;
+            fait++;
+            setProgres({ fait, total, statut: "En cours", etat: "en", detail: `${libelleLot} · dernière carte traitée : ${x.c.nom}` });
+          }
         }
 
         if (!RUN.stop && li < lots.length - 1) {
@@ -595,8 +671,8 @@
     if (!cartes.length) return journal("Aucune carte : coche une étiquette chargée sur la page.");
     if (cartes.length > CONFIRMATION_A_PARTIR_DE && !confirm(
       `${on ? "Verrouiller" : "Déverrouiller"} ${pluriel(cartes.length, "carte")} ?\n` +
-      `Au plus ${Math.ceil(cartes.length * DELAI_ENTRE_VERROUILLAGES_MS / 60000)} min (${DELAI_ENTRE_VERROUILLAGES_MS / 1000} s entre deux verrouillages, ` +
-      `les cartes déjà dans l'état demandé sont ignorées).`)) return;
+      `Les exemplaires partent par ${EXEMPLAIRES_PAR_ENVOI} en un seul envoi, ${DELAI_ENTRE_VERROUILLAGES_MS / 1000} s entre deux envois ; ` +
+      `les cartes déjà dans l'état demandé sont ignorées.`)) return;
     traiter(cartes, on);
   }
 
