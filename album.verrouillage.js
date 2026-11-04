@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         [test]Wiki-Pick verrouillage (tiroir d'export)
 // @namespace    local.wikipick.lock
-// @version      2.15
+// @version      2.16
 // @description  Verrouille ou déverrouille les cartes d'étiquettes, ou une à une, depuis le tiroir d'export d'Album+cleaner
 // @match        https://wiki-pick.com/*
 // @grant        none
@@ -43,6 +43,9 @@
   // wpx.discord.achats n'y est pas : l'effacer à chaque sortie ferait repartir vers Discord les achats des 2 dernières heures.
   const VIDER_EN_QUITTANT = true;
   const CACHES_VIDES_EN_QUITTANT = ["wpx.aDeja.", "wpx.chances.comptes"];
+  // (2.16) en quittant le panneau de verrouillage, la page se recharge (F5) : affichage et mémoire repartent de zéro.
+  // Si un traitement tourne encore, le rechargement attend sa fin.
+  const RAFRAICHIR_EN_QUITTANT = true;
   // ===== FIN DES PARAMÈTRES =====
 
   if (window.__wpxVerrouActif) return;
@@ -447,8 +450,12 @@
 
   // En quittant le panneau : tout est vidé, sans confirmation (exporte le journal avant de sortir si tu veux le garder).
   // Un traitement en cours continue : le vidage se fait à sa fin, si tu n'es pas revenu dans le panneau entre-temps.
+  function rafraichirSiDemande() {
+    if (RAFRAICHIR_EN_QUITTANT) location.reload();
+  }
+
   function viderEnQuittant() {
-    if (!VIDER_EN_QUITTANT) return;
+    if (!VIDER_EN_QUITTANT) return rafraichirSiDemande();
     if (RUN.en) { ETAT.aVider = true; return; }
     ETAT.aVider = false;
     LOG.length = 0;
@@ -475,6 +482,7 @@
       }
       cles.forEach(k => localStorage.removeItem(k));
     } catch (e) { /* stockage indisponible : rien à retirer */ }
+    rafraichirSiDemande();
   }
 
   // ---------- Progression ----------
