@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         [test]Wiki-Pick verrouillage (tiroir d'export)
 // @namespace    local.wikipick.lock
-// @version      2.14
+// @version      2.15
 // @description  Verrouille ou déverrouille les cartes d'étiquettes, ou une à une, depuis le tiroir d'export d'Album+cleaner
 // @match        https://wiki-pick.com/*
 // @grant        none
@@ -19,8 +19,9 @@
   // (2.8) verrouillages : un seul à la fois, et ce délai entre la fin de l'un et le départ du suivant.
   // Les lectures des copies, elles, restent rapides (LECTURES_SIMULTANEES en parallèle, sans délai).
   const DELAI_ENTRE_VERROUILLAGES_MS = 900;
-  // (2.14) les exemplaires partent en un seul envoi groupé, comme le fait le site, jusqu'à ce nombre par envoi
-  const EXEMPLAIRES_PAR_ENVOI = 25;
+  // (2.14) les exemplaires partent en envoi groupé, comme le fait le site, jusqu'à ce nombre par envoi
+  // (2.15) 99 par défaut : une liste de 99 cartes part en un seul envoi. Si le site refuse les gros envois, baisse ce nombre.
+  const EXEMPLAIRES_PAR_ENVOI = 99;
   const CONFIRMATION_A_PARTIR_DE = 10;       // demande confirmation au-delà de ce nombre de cartes
   const TAILLE_LOT = 100;                    // cartes traitées par lot
   const LECTURES_SIMULTANEES = 4;            // lectures de la collection en parallèle, dans un bloc
