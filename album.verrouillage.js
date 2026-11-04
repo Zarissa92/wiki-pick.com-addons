@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         [test]Wiki-Pick verrouillage (tiroir d'export)
 // @namespace    local.wikipick.lock
-// @version      2.16
+// @version      2.18
 // @description  Verrouille ou déverrouille les cartes d'étiquettes, ou une à une, depuis le tiroir d'export d'Album+cleaner
 // @match        https://wiki-pick.com/*
 // @grant        none
@@ -18,21 +18,19 @@
   // ===== PARAMÈTRES MODIFIABLES =====
   // (2.8) verrouillages : un seul à la fois, et ce délai entre la fin de l'un et le départ du suivant.
   // Les lectures des copies, elles, restent rapides (LECTURES_SIMULTANEES en parallèle, sans délai).
-  const DELAI_ENTRE_VERROUILLAGES_MS = 900;
-  // (2.14) les exemplaires partent en envoi groupé, comme le fait le site, jusqu'à ce nombre par envoi
-  // (2.15) 99 par défaut : une liste de 99 cartes part en un seul envoi. Si le site refuse les gros envois, baisse ce nombre.
-  const EXEMPLAIRES_PAR_ENVOI = 99;
+  const DELAI_ENTRE_VERROUILLAGES_MS = 1200;
+  // (2.18) un lot = un seul envoi groupé d'exemplaires, comme le fait le site.
+  // Si le site refuse les gros envois, baisse TAILLE_LOT.
   const CONFIRMATION_A_PARTIR_DE = 10;       // demande confirmation au-delà de ce nombre de cartes
-  const TAILLE_LOT = 100;                    // cartes traitées par lot
-  const LECTURES_SIMULTANEES = 4;            // lectures de la collection en parallèle, dans un bloc
-  const LECTURES_PAR_BLOC = 50;              // (2.9) les copies sont lues par blocs de 50 cartes…
-  const PAUSE_ENTRE_BLOCS_LECTURE_MS = 1500; // … avec cette pause entre deux blocs
+  // (2.17) cartes traitées par lot : chaque lot est lu carte par carte, puis envoyé
+  const TAILLE_LOT = 100;
+  const LECTURES_SIMULTANEES = 1;            // lectures de la collection en parallèle, dans un lot
+  const PAUSE_ENTRE_LOTS_MS = 2000;          // pause entre deux lots
   // (2.10) quand le site répond 429 (« trop de requêtes ») : toutes les requêtes de l'outil s'arrêtent le temps demandé
   // par le site (en-tête Retry-After), sinon ATTENTE_429_MS, doublée à chaque nouveau refus, puis la même requête repart
   const REESSAIS_429 = 5;                    // nouveaux essais au plus pour une même requête
   const ATTENTE_429_MS = 5000;               // première attente si le site ne dit pas combien
   const ATTENTE_429_MAX_MS = 120000;         // jamais plus de 2 min d'un coup
-  const PAUSE_ENTRE_LOTS_MS = 2000;          // pause entre deux lots
   const URL_SITE = "https://wiki-pick.com";
   const LIGNES_AFFICHEES_MAX = 300;          // lignes du journal affichées à l'écran (tout reste dans l'export)
   const LIGNES_GARDEES_MAX = 20000;          // lignes gardées en mémoire pour l'export
@@ -264,34 +262,25 @@
     return res.status;
   }
 
-  // Lit les copies de toutes les cartes d'un lot, par blocs de LECTURES_PAR_BLOC cartes (LECTURES_SIMULTANEES à la
-  // fois dans un bloc), avec PAUSE_ENTRE_BLOCS_LECTURE_MS entre deux blocs.
+  // (2.17) Lit les copies de toutes les cartes d'un lot, carte par carte (LECTURES_SIMULTANEES à la fois).
   // Chaque cid n'est lu qu'une fois par lot ; le résultat va dans `copies` : {copies} ou {erreur}.
   async function lireLot(lot, copies, progres) {
     const cids = [...new Set(lot.map(c => c.cid))];
+    let suivant = 0;
     let lus = 0;
-    for (let debut = 0; debut < cids.length && !RUN.stop; debut += LECTURES_PAR_BLOC) {
-      if (debut > 0) {
-        progres(lus, cids.length, `pause de ${PAUSE_ENTRE_BLOCS_LECTURE_MS / 1000} s avant le bloc suivant`);
-        await pause(PAUSE_ENTRE_BLOCS_LECTURE_MS);
-        if (RUN.stop) break;
-      }
-      const bloc = cids.slice(debut, debut + LECTURES_PAR_BLOC);
-      let suivant = 0;
-      const travailleur = async () => {
-        while (suivant < bloc.length && !RUN.stop) {
-          const cid = bloc[suivant++];
-          try {
-            copies.set(cid, { copies: await exemplairesDe(cid) });
-          } catch (erreur) {
-            copies.set(cid, { erreur });
-          }
-          lus++;
-          progres(lus, cids.length);
+    const travailleur = async () => {
+      while (suivant < cids.length && !RUN.stop) {
+        const cid = cids[suivant++];
+        try {
+          copies.set(cid, { copies: await exemplairesDe(cid) });
+        } catch (erreur) {
+          copies.set(cid, { erreur });
         }
-      };
-      await Promise.all(Array.from({ length: Math.min(LECTURES_SIMULTANEES, bloc.length) }, travailleur));
-    }
+        lus++;
+        progres(lus, cids.length);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(LECTURES_SIMULTANEES, cids.length) }, travailleur));
   }
 
   // ---------- Journal ----------
@@ -535,10 +524,10 @@
         const libelleLot = `Lot ${li + 1}/${lots.length}`;
         journal(`--- ${libelleLot} : ${pluriel(lot.length, "carte")} ---`);
 
-        // 1) lecture des copies du lot, en parallèle
+        // 1) lecture des copies du lot, carte par carte
         const copies = new Map();
-        await lireLot(lot, copies, (lus, nb, note) => {
-          setProgres({ fait, total, statut: "En cours", etat: "en", detail: `${libelleLot} · lecture des copies ${lus} / ${nb}` + (note ? ` · ${note}` : "") });
+        await lireLot(lot, copies, (lus, nb) => {
+          setProgres({ fait, total, statut: "En cours", etat: "en", detail: `${libelleLot} · lecture des copies ${lus} / ${nb}` });
         });
 
         // 2) tri : ce qui est absent ou déjà dans l'état demandé ne part pas au site
@@ -572,27 +561,14 @@
         }
         setProgres({ fait, total, statut: "En cours", etat: "en", detail: `${libelleLot} · ${pluriel(aEnvoyer.length, "carte")} à ${on ? "verrouiller" : "déverrouiller"}` });
 
-        // 3) envoi par groupes de EXEMPLAIRES_PAR_ENVOI exemplaires (une carte n'est jamais coupée en deux, sauf si elle
-        //    a à elle seule plus d'exemplaires que la taille d'un groupe), DELAI_ENTRE_VERROUILLAGES_MS entre deux envois
-        const groupes = [];
-        let courant = [];
-        let taille = 0;
-        for (const x of aEnvoyer) {
-          if (courant.length && taille + x.ids.length > EXEMPLAIRES_PAR_ENVOI) {
-            groupes.push(courant);
-            courant = [];
-            taille = 0;
-          }
-          courant.push(x);
-          taille += x.ids.length;
-        }
-        if (courant.length) groupes.push(courant);
+        // 3) (2.18) un seul envoi par lot : tous les exemplaires à changer du lot partent ensemble
+        const groupes = aEnvoyer.length ? [aEnvoyer] : [];
 
         for (let gi = 0; gi < groupes.length && !RUN.stop; gi++) {
           const groupe = groupes[gi];
           const ids = groupe.flatMap(x => x.ids);
           setProgres({ fait, total, statut: "En cours", etat: "en",
-            detail: `${libelleLot} · envoi ${gi + 1}/${groupes.length} : ${pluriel(groupe.length, "carte")}, ${pluriel(ids.length, "exemplaire")}` });
+            detail: `${libelleLot} · envoi : ${pluriel(groupe.length, "carte")}, ${pluriel(ids.length, "exemplaire")}` });
           let reussi = false;
           if (GROUPE.possible && ids.length > 1) {
             try {
@@ -680,7 +656,7 @@
     if (!cartes.length) return journal("Aucune carte : coche une étiquette chargée sur la page.");
     if (cartes.length > CONFIRMATION_A_PARTIR_DE && !confirm(
       `${on ? "Verrouiller" : "Déverrouiller"} ${pluriel(cartes.length, "carte")} ?\n` +
-      `Les exemplaires partent par ${EXEMPLAIRES_PAR_ENVOI} en un seul envoi, ${DELAI_ENTRE_VERROUILLAGES_MS / 1000} s entre deux envois ; ` +
+      `Les cartes sont traitées par lots de ${TAILLE_LOT} : chaque lot part en un seul envoi, ${PAUSE_ENTRE_LOTS_MS / 1000} s entre deux lots ; ` +
       `les cartes déjà dans l'état demandé sont ignorées.`)) return;
     traiter(cartes, on);
   }
