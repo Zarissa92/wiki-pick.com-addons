@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         [test]Album+cleaner — tri par date d'obtention (addon)
 // @namespace    local
-// @version      1.7
+// @version      1.8
 // @description  Addon de Album+cleaner+Maximisation : dans « Ma collection », trie les cartes de la page par date d'obtention, et ouvre « Mes dernières cartes » (les N dernières obtenues, toute la collection) pour les étiqueter, les verrouiller ou les mettre de côté pour la vente, une par une ou en lot, par les fiches du site.
 // @match        https://wiki-pick.com/*
 // @grant        none
@@ -20,7 +20,7 @@ window.__wpxTriDate = true;
    CONFIGURATION
    ========================================================================== */
 const CONFIG = {
-    VERSION: "1.7",
+    VERSION: "1.8",
 
     /*
      * TRI DE LA PAGE : les N premières cartes de la page, dans l'ordre du site ; les suivantes gardent leur place
@@ -38,7 +38,7 @@ const CONFIG = {
      */
     DERNIERES: {
         parDefaut: 200,
-        min: 10,
+        min: 1,
         max: 1000,
         marge: 100,
         histoFrais: 60,
@@ -52,7 +52,7 @@ const CONFIG = {
      *   relireMin : une carte dont l'exemplaire affiché n'est pas encore connu est relue, au plus toutes les N minutes ;
      *               une fiche illisible n'est pas redemandée avant
      */
-    lecturesSimultanees: 50,
+    lecturesSimultanees: 4,
     pauseMs: 400,
     pause429Ms: 5000,
     essais429: 3,
@@ -66,7 +66,7 @@ const CONFIG = {
         recent: "Date : plus récentes d'abord",
         ancien: "Date : plus anciennes d'abord",
         aide: "Trier les cartes de la page par date d'obtention",
-        nombreAide: "Nombre de cartes : jusqu'à 100, les premières de la page sont triées ; au-delà, « Mes dernières cartes » s'ouvre sur toute la collection",
+        nombreAide: "Nombre de cartes : OK (ou Entrée) ouvre « Mes dernières cartes » sur toute la collection ; le tri de la page en prend au plus 100",
         validerAide: "Valider le nombre (ou Entrée)",
         premieres: "cartes",
         lecture: "Dates : ",
@@ -1048,33 +1048,28 @@ function construireInterface() {
     nombreTri.type = "number";
     nombreTri.min = "1";
     nombreTri.max = String(DN.max);
-    nombreTri.value = String(nCartes);
+    nombreTri.value = String(memoire.lire("tri.dernieres.n", DN.parDefaut));
     nombreTri.title = T.nombreAide;
     nombreTri.setAttribute("aria-label", T.nombreAide);
     /* (1.2) la valeur ne compte qu'une fois validée : OK ou Entrée */
     const valider = el("button", {type: "button", class: "wpx-dn-btn", title: T.validerAide}, "OK");
+    /* (1.8) OK ouvre toujours la fenêtre des dernières cartes, sur toute la collection, quel que soit le nombre.
+       Le tri de la page (le menu) suit le même nombre, borné à une page du site. */
     const validerNombre = () => {
         const n = parseInt(nombreTri.value, 10);
         if (!(n >= 1)) {
-            nombreTri.value = String(nCartes);
+            nombreTri.value = String(memoire.lire("tri.dernieres.n", DN.parDefaut));
             return;
         }
-        /* plus de cartes qu'une page du site n'en montre : la fenêtre des dernières cartes, sur toute la collection */
-        if (n > CONFIG.cartesMax) {
-            nombreTri.value = String(Math.min(n, DN.max));
-            ouvrirDernieres(Math.min(n, DN.max));
-            return;
+        const total = Math.min(n, DN.max);
+        nombreTri.value = String(total);
+        ouvrirDernieres(total);
+        const page = Math.min(n, CONFIG.cartesMax);
+        if (page !== nCartes) {
+            nCartes = page;
+            memoire.ecrire("tri.n", nCartes);
+            if (mode !== "site") planifier();
         }
-        nCartes = n;
-        memoire.ecrire("tri.n", nCartes);
-        if (mode === "site") {
-            mode = "recent";
-            memoire.ecrire("tri.mode", mode);
-            majInterface(TRI.grille);
-        }
-        TRI.jeton++;
-        if (TRI.occupe) TRI.encore = true;
-        else trier();
     };
     valider.addEventListener("click", validerNombre);
     nombreTri.addEventListener("keydown", e => {
