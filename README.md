@@ -1,8 +1,8 @@
 # Wiki-Pick — addons
 
-Des userscripts que j'ai faits pour jouer à [wiki-pick.com](https://wiki-pick.com) plus confortablement : un site plus lisible, des exports de mes étiquettes, le verrouillage de mes cartes en masse, le masquage des vendeurs que j'ai bloqués et le tri de ma collection par date d'ajout.
+Des userscripts faits pour jouer à [wiki-pick.com](https://wiki-pick.com) plus confortablement. **TOUT EST VIBECODE**
 
-Tout tourne dans le navigateur. Le site n'est pas modifié, il n'y a pas de serveur à moi derrière, et les réglages restent dans le `localStorage` du navigateur.
+Tout tourne dans le navigateur. Le site n'est pas modifié, il n'y a pas de serveur à moi derrière, et les réglages restent dans le `localStorage` du navigateur. J'utilise perso, **greasemonkey**. 
 
 | Script | Fichier | Version | Rôle |
 |---|---|---|---|
