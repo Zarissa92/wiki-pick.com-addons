@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         [test]Album+cleaner — tri par date d'obtention (addon)
 // @namespace    local
-// @version      1.8
-// @description  Addon de Album+cleaner+Maximisation : dans « Ma collection », trie les cartes de la page par date d'obtention, et ouvre « Mes dernières cartes » (les N dernières obtenues, toute la collection) pour les étiqueter, les verrouiller ou les mettre de côté pour la vente, une par une ou en lot, par les fiches du site.
+// @version      2.5
+// @description  Addon de Album+cleaner+Maximisation : garde toute ta collection dans le navigateur (mise à jour par différences), trie les cartes de la page par date d'obtention, et ouvre « Mes dernières cartes » (les N dernières obtenues, toute la collection) pour les étiqueter, les verrouiller ou les mettre de côté pour la vente, une par une ou en lot, par les fiches du site.
 // @match        https://wiki-pick.com/*
 // @grant        none
 // @run-at       document-idle
@@ -20,7 +20,7 @@ window.__wpxTriDate = true;
    CONFIGURATION
    ========================================================================== */
 const CONFIG = {
-    VERSION: "1.8",
+    VERSION: "2.5",
 
     /*
      * TRI DE LA PAGE : les N premières cartes de la page, dans l'ordre du site ; les suivantes gardent leur place
@@ -167,7 +167,9 @@ async function lireJSON(chemin) {
             continue;
         }
         if (!r.ok) throw new Error("HTTP " + r.status);
-        return r.json();
+        /* (2.2) le texte, décodé ici : sous Firefox, les objets de .json() appartiennent à la page et ne peuvent pas
+           être rangés dans ceux du script (« XrayWrapper ») */
+        return JSON.parse(await r.text());
     }
     throw new Error("trop de requêtes");
 }
@@ -252,6 +254,10 @@ async function lireFiches(demandes, continuer, progres) {
             }
         });
         ecrireCache(cache);
+        /* (2.0) les dates lues vont aussi dans la base de la collection (si elle existe) */
+        const dates = [];
+        for (const cid of lot) for (const [id, t] of Object.entries((cache.cartes[cid] || {}).ex || {})) if (t) dates.push([+id, {t}]);
+        if (BASE.etat && baseInitialisee(BASE.etat)) await modifierExemplaires(dates).catch(() => {});
         progres(Math.min(i + lot.length, cids.length), cids.length);
         if (i + lot.length < cids.length) await pause(CONFIG.pauseMs);
     }
@@ -340,6 +346,7 @@ function placer(g, ordre) {
 }
 
 async function trier() {
+    majVisibiliteBouton();
     const g = grille();
     majInterface(g);
     if (!g) return;
@@ -501,6 +508,676 @@ async function candidatsHistorique(n) {
 }
 
 /* ==========================================================================
+   (2.0) LA BASE DE LA COLLECTION
+   Toute ta collection, gardée dans le navigateur (IndexedDB « wpx-collection », partagée avec tes autres outils sur
+   wiki-pick.com) : un enregistrement par exemplaire {id, cid, n, d, img, r, sh, locked, tags, t (date d'obtention)}.
+   - Initialisation, une fois : toutes les pages de chaque rang (M … C), puis des chromatiques (SH). Reprenable :
+     la page atteinte est notée après chaque page.
+   - Ensuite, seulement les différences avec la dernière fois (T-1) :
+       * chaque liste (un rang, ou les chromatiques) est rangée par identifiant décroissant : les nouveaux exemplaires
+         sont en tête, on lit jusqu'à retomber sur un identifiant connu ;
+       * le site donne le nombre d'exemplaires de la liste : s'il ne colle pas, une recherche par dichotomie trouve la
+         page qui a bougé (une carte vendue, ou reçue avec un ancien identifiant), on la relit, et ainsi de suite ;
+       * le site donne aussi le nombre d'exemplaires de chaque étiquette : seule une étiquette dont le compte a changé
+         est relue ;
+       * les cadenas posés (par le site ou tes outils) sont notés au passage.
+   - Deux changements qui se compensent dans une même liste passent inaperçus : « Tout vérifier » relit tout.
+   ========================================================================== */
+const BASE = {nom: "wpx-collection", db: null, occupe: false, etat: null};
+const LISTES_RANGS = ["M", "L", "UR", "SR", "R", "PC", "C"];
+const LISTES_BASE = LISTES_RANGS.concat("SH");
+const BUDGET_LISTE = 60;            // pages lues au plus par liste pour une mise à jour, avant de la relire en entier
+
+/* (2.1) le nom d'une liste dans le journal ; les pages faites et prévues de la construction */
+const nomListe = rar => (rar === "SH" ? "Chromatiques" : (RANGS[rar] || rar) + "s");
+const pagesFaites = etat => Object.values((etat.init && etat.init.listes) || {}).reduce((s, l) => s + (l.page || 0), 0);
+function pagesPrevues(etat) {
+    const listes = (etat.init && etat.init.listes) || {};
+    const parRang = (etat.resume && etat.resume.parRang) || {};
+    /* pour chaque liste : son nombre de pages s'il est connu, sinon une estimation d'après le résumé de la collection */
+    return LISTES_BASE.reduce((s, rar) => s + ((listes[rar] && listes[rar].pages > 1) ? listes[rar].pages
+        : rar === "SH" ? ((listes.SH && listes.SH.pages) || 1) : Math.max(1, Math.ceil((parRang[rar] || 0) / 100))), 0);
+}
+
+/* (2.1) le journal de la base : gardé pour la session de l'onglet (500 lignes), affiché dans le tableau de bord */
+const JB = {lignes: [], prevu: 0};
+try {
+    const garde = JSON.parse(sessionStorage.getItem("wpx.base.journal") || "null");
+    if (Array.isArray(garde)) JB.lignes = garde;
+} catch (erreur) { /* rien */ }
+function journalBase(texte, niveau) {
+    JB.lignes.push([Date.now(), String(texte), niveau || ""]);
+    if (JB.lignes.length > 500) JB.lignes.splice(0, JB.lignes.length - 500);
+    if (niveau === "erreur" || niveau === "alerte") console.warn("[base]", texte);
+    if (!JB.prevu) {
+        JB.prevu = setTimeout(() => {
+            JB.prevu = 0;
+            try { sessionStorage.setItem("wpx.base.journal", JSON.stringify(JB.lignes)); } catch (erreur) { /* rien */ }
+        }, 1000);
+    }
+    ajouterAuJournal(JB.lignes[JB.lignes.length - 1]);
+}
+
+/* (2.1) la progression du travail en cours : la barre du tableau de bord la suit */
+function avancer(fait, total, texte) {
+    BASE.progres = {fait, total, texte};
+    majBarreBase();
+}
+
+function ouvrirBase() {
+    if (BASE.db) return Promise.resolve(BASE.db);
+    return new Promise((ok, ko) => {
+        const req = indexedDB.open(BASE.nom, 1);
+        req.onupgradeneeded = () => {
+            const db = req.result;
+            const ex = db.createObjectStore("ex", {keyPath: "id"});
+            ex.createIndex("tags", "tags", {multiEntry: true});
+            ex.createIndex("cid", "cid");
+            ex.createIndex("r", "r");
+            ex.createIndex("shk", "shk");           // 1 pour une chromatique, absent sinon
+            db.createObjectStore("meta");
+        };
+        req.onsuccess = () => {
+            BASE.db = req.result;
+            BASE.db.onversionchange = () => { BASE.db.close(); BASE.db = null; };
+            ok(BASE.db);
+        };
+        req.onerror = () => ko(req.error);
+        req.onblocked = () => ko(new Error("base bloquée par un autre onglet"));
+    });
+}
+/* (2.3) Sous Firefox, ce que la base renvoie appartient à la page : le script ne peut pas y ranger ses propres objets
+   (« XrayWrapper »). Tout ce qui est lu dans la base est donc recopié côté script avant d'être utilisé ou modifié. */
+const cloner = v => (v && typeof v === "object" ? JSON.parse(JSON.stringify(v)) : v);
+const attendreReq = req => new Promise((ok, ko) => { req.onsuccess = () => ok(cloner(req.result)); req.onerror = () => ko(req.error); });
+const attendreTx = tx => new Promise((ok, ko) => { tx.oncomplete = () => ok(); tx.onerror = tx.onabort = () => ko(tx.error || new Error("transaction annulée")); });
+
+async function lireEtatBase() {
+    const db = await ouvrirBase();
+    BASE.etat = (await attendreReq(db.transaction("meta").objectStore("meta").get("etat"))) || {};
+    return BASE.etat;
+}
+async function ecrireEtatBase(etat) {
+    const db = await ouvrirBase();
+    const tx = db.transaction("meta", "readwrite");
+    tx.objectStore("meta").put(etat, "etat");
+    await attendreTx(tx);
+    BASE.etat = etat;
+}
+const baseInitialisee = etat => !!(etat && etat.init && etat.init.fini);
+
+/* les lignes d'une page (rang ou chromatiques) dans la base ; un exemplaire garde sa date et sa marque chromatique */
+async function ecrireLignes(lignes, chromatiques) {
+    const db = await ouvrirBase();
+    const tx = db.transaction("ex", "readwrite");
+    const s = tx.objectStore("ex");
+    for (const l of lignes) {
+        if (!Array.isArray(l) || !Array.isArray(l[9])) continue;
+        for (const id of l[9]) {
+            if (!Number.isInteger(id)) continue;
+            const lecture = s.get(id);
+            lecture.onsuccess = () => {
+                const a = cloner(lecture.result);
+                const sh = chromatiques || !!(a && a.sh);
+                const e = {id, cid: String(l[0]), n: String(l[1] || l[0]), d: String(l[2] || ""), img: String(l[3] || ""),
+                    r: chromatiques && a ? a.r : String(l[4] || "C"), locked: !!l[8],
+                    tags: (Array.isArray(l[10]) ? l[10] : []).map(Number), sh, t: (a && a.t) || 0};
+                if (sh) e.shk = 1;
+                s.put(e);
+            };
+        }
+    }
+    await attendreTx(tx);
+}
+
+/* un exemplaire qui a quitté la liste : retiré de la base (un rang), ou seulement de ses chromatiques (SH) */
+async function retirerDeListe(rar, ids) {
+    if (!ids.length) return;
+    const db = await ouvrirBase();
+    const tx = db.transaction("ex", "readwrite");
+    const s = tx.objectStore("ex");
+    for (const id of ids) {
+        if (rar !== "SH") {
+            s.delete(id);
+            continue;
+        }
+        const lecture = s.get(id);
+        lecture.onsuccess = () => {
+            const a = cloner(lecture.result);
+            if (!a) return;
+            a.sh = false;
+            delete a.shk;
+            s.put(a);
+        };
+    }
+    await attendreTx(tx);
+}
+
+/* les identifiants d'une liste dans la base, du plus grand au plus petit */
+async function idsDeListe(rar) {
+    const db = await ouvrirBase();
+    const index = db.transaction("ex").objectStore("ex").index(rar === "SH" ? "shk" : "r");
+    const ids = await attendreReq(index.getAllKeys(IDBKeyRange.only(rar === "SH" ? 1 : rar)));
+    return ids.sort((a, b) => b - a);
+}
+
+/* modifie des exemplaires de la base (dates, cadenas…) : modifs = [[id, {champ: valeur}]] */
+async function modifierExemplaires(modifs) {
+    if (!modifs.length) return;
+    const db = await ouvrirBase();
+    const tx = db.transaction("ex", "readwrite");
+    const s = tx.objectStore("ex");
+    for (const [id, champs] of modifs) {
+        const lecture = s.get(id);
+        lecture.onsuccess = () => {
+            if (lecture.result) s.put(Object.assign(cloner(lecture.result), champs));
+        };
+    }
+    await attendreTx(tx);
+}
+
+async function lirePageListe(rar, page, tag) {
+    return lireJSON("/api/collection/page?" + new URLSearchParams({vue: "cartes", q: "", rar: rar || "", tag: tag || "", excl: "1", page}));
+}
+
+/* ce que chaque page apprend en plus des cartes : préfixes d'images, étiquettes, résumé de la collection */
+function noterInfos(etat, d) {
+    if (Array.isArray(d.imgp)) etat.imgp = d.imgp;
+    if (Array.isArray(d.tags)) etat.tags = d.tags.map(t => ({id: t.id, name: t.name, color: t.color}));
+    if (d.resume && typeof d.resume === "object") etat.resume = d.resume;
+}
+
+const idsDePage = d => (d && Array.isArray(d.lignes) ? d.lignes.flatMap(l => (Array.isArray(l) && Array.isArray(l[9]) ? l[9].filter(Number.isInteger) : [])) : []);
+
+/* --------------------------------------------------------------------------
+   LES DIFFÉRENCES D'UNE LISTE (sans la base : testable à part)
+   local : les identifiants connus, décroissants ; lirePage(p) : la page p du site, telle qu'elle est maintenant.
+   Renvoie {liste (l'état du site), retraits (identifiants partis), pages (les pages lues : leurs lignes sont à écrire)}.
+   Lève une erreur si le budget de pages est dépassé ou si le site n'est pas rangé comme prévu (on relira tout).
+   -------------------------------------------------------------------------- */
+async function differencesListe(local, lirePage, budget) {
+    let liste = local.slice();
+    const pages = new Map();
+    const retraits = new Set();
+    let lues = 0, limite = budget;
+    const lire = async p => {
+        if (pages.has(p)) return pages.get(p);
+        if (++lues > limite) throw new Error("trop de changements");
+        const d = await lirePage(p);
+        if (!d || !Array.isArray(d.lignes)) throw new Error("réponse inattendue");
+        const ids = idsDePage(d);
+        if (ids.some((id, i) => i && ids[i - 1] <= id)) throw new Error("liste pas rangée par identifiant décroissant");
+        pages.set(p, d);
+        return d;
+    };
+    const d0 = await lire(0);
+    const total = Number(d0.total) || 0;
+    const nbPages = Math.max(1, Number(d0.pages) || 1);
+    const parPage = Math.max(1, idsDePage(d0).length);
+    /* une longue liste (les communes : plus de 460 pages) a droit à plus de lectures avant d'être relue en entier */
+    limite = Math.max(budget, Math.floor(nbPages / 3));
+    const ajustees = new Set();
+    /* La page p répond pour tout ce qui est sous le dernier identifiant de la page d'avant et jusqu'à son propre
+       dernier : les pages se suivent sans trou (une carte partie juste entre deux pages est vue). On s'aligne dessus. */
+    const ajuster = async p => {
+        const ids = idsDePage(await lire(p));
+        const avant = p > 0 ? idsDePage(await lire(p - 1)) : [];
+        const haut = p === 0 ? Infinity : avant.length ? avant[avant.length - 1] : Infinity;      // exclu
+        const bas = p >= nbPages - 1 ? -Infinity : ids.length ? ids[ids.length - 1] : haut;      // inclus
+        const presents = new Set(ids);
+        const connus = new Set(liste);
+        liste = liste.filter(id => {
+            if (id < haut && id >= bas && !presents.has(id)) {
+                retraits.add(id);
+                return false;
+            }
+            return true;
+        });
+        for (const id of ids) if (!connus.has(id)) liste.push(id);
+        liste.sort((a, b) => b - a);
+        for (const id of ids) retraits.delete(id);
+        ajustees.add(p);
+    };
+    await ajuster(0);
+    /* la tête : tant que la page lue ne contient que du neuf, la suivante aussi */
+    const plusGrandConnu = local.length ? local[0] : -Infinity;
+    for (let p = 0; p + 1 < nbPages; p++) {
+        const ids = idsDePage(pages.get(p));
+        if (!ids.length || ids[ids.length - 1] <= plusGrandConnu) break;
+        await ajuster(p + 1);
+    }
+    /* le milieu : le nombre ne colle pas. On cherche la première page dont le premier identifiant n'est plus à sa
+       place (dichotomie) : le changement est dans cette page ou celle d'avant ; on s'aligne sur les deux, et on recommence. */
+    while (liste.length !== total) {
+        let a = 1, b = nbPages - 1, premiere = nbPages;
+        while (a <= b) {
+            const m = (a + b) >> 1;
+            const id0 = idsDePage(await lire(m))[0];
+            if (id0 !== liste[m * parPage]) {
+                premiere = m;
+                b = m - 1;
+            } else {
+                a = m + 1;
+            }
+        }
+        let cibles = (premiere === nbPages ? [nbPages - 1] : [premiere - 1, premiere]).filter(p => p >= 0 && !ajustees.has(p));
+        if (!cibles.length) {
+            /* déjà alignées sans que le compte colle : on avance page par page dans ce qui n'a pas été vu */
+            const reste = [...Array(nbPages).keys()].find(p => !ajustees.has(p));
+            if (reste === undefined) break;
+            cibles = [reste];
+        }
+        for (const p of cibles) await ajuster(p);
+    }
+    if (liste.length !== total) throw new Error("écart persistant");
+    return {liste, retraits: [...retraits], pages, lues};
+}
+
+/* une liste relue en entier (initialisation, ou quand les différences ne suffisent pas) */
+async function relireListe(rar, etat, progres, continuer) {
+    const vus = new Set();
+    let page = 0, nbPages = 1;
+    while (page < nbPages) {
+        if (!continuer()) return false;
+        const d = await lirePageListe(rar, page);
+        noterInfos(etat, d);
+        await ecrireLignes(d.lignes || [], rar === "SH");
+        idsDePage(d).forEach(id => vus.add(id));
+        nbPages = Math.max(1, Number(d.pages) || 1);
+        page++;
+        progres(rar, page, nbPages);
+        await pause(CONFIG.pauseMs);
+    }
+    const partis = (await idsDeListe(rar)).filter(id => !vus.has(id));
+    await retirerDeListe(rar, partis);
+    journalBase(nomListe(rar) + " relue en entier : " + nombre(vus.size) + " exemplaire(s), " + nombre(partis.length) + " retiré(s)");
+    return true;
+}
+
+/* L'initialisation, reprenable : etat.init.listes[rar] = {page, pages} ; la page atteinte est notée après chaque page */
+async function initialiserBase(progres, continuer) {
+    const etat = await lireEtatBase();
+    if (!etat.init) etat.init = {debut: Date.now(), listes: {}};
+    const dejaLues = pagesFaites(etat);
+    journalBase(dejaLues ? "Construction : reprise après " + nombre(dejaLues) + " page(s)" : "Construction de la base : début");
+    for (const rar of LISTES_BASE) {
+        const st = etat.init.listes[rar] || (etat.init.listes[rar] = {page: 0, pages: 1, fini: false});
+        while (!st.fini) {
+            if (!continuer()) {
+                etat.init.enCours = false;                 // en pause : elle ne reprendra pas seule au chargement
+                await ecrireEtatBase(etat);
+                journalBase("Construction en pause (" + nomListe(rar) + ", page " + (st.page + 1) + ")");
+                return false;
+            }
+            const d = await lirePageListe(rar, st.page);
+            noterInfos(etat, d);
+            await ecrireLignes(d.lignes || [], rar === "SH");
+            st.pages = Math.max(1, Number(d.pages) || 1);
+            st.page++;
+            st.fini = st.page >= st.pages;
+            await ecrireEtatBase(etat);
+            avancer(pagesFaites(etat), pagesPrevues(etat), "Construction : " + nomListe(rar) + ", page " + st.page + " / " + st.pages);
+            progres(etat);
+            if (st.fini) journalBase(nomListe(rar) + " : " + pluriel(st.pages, "page lue", "pages lues"));
+            await pause(CONFIG.pauseMs);
+        }
+    }
+    etat.init.fini = Date.now();
+    etat.complet = Date.now();
+    await ecrireEtatBase(etat);
+    journalBase("Construction terminée : " + pluriel(await compterBase(), "exemplaire") + ". Une mise à jour rattrape ce qui a bougé pendant la lecture.", "ok");
+    /* la collection a pu bouger pendant la lecture : une mise à jour rattrape */
+    await majBaseDifferences(() => {}, continuer, true);
+    await reprendreDatesDuCache();
+    return true;
+}
+
+/* La mise à jour par différences. etat.majListes garde le nombre de pages lues, pour l'affichage. */
+async function majBaseDifferences(progres, continuer, sansVerrou) {
+    const etat = await lireEtatBase();
+    if (!baseInitialisee(etat)) return {lues: 0};
+    let lues = 0;
+    const relues = [];
+    const etapes = LISTES_BASE.length + 2;
+    let ajoutsTotal = 0, retraitsTotal = 0;
+    journalBase("Mise à jour : début");
+    for (const [i, rar] of LISTES_BASE.entries()) {
+        if (!continuer()) return {lues, relues};
+        progres("Mise à jour : " + rar + "…");
+        avancer(i, etapes, "Mise à jour : " + nomListe(rar) + "…");
+        const local = await idsDeListe(rar);
+        try {
+            const r = await differencesListe(local, async p => {
+                const d = await lirePageListe(rar, p);
+                noterInfos(etat, d);
+                await pause(CONFIG.pauseMs);
+                return d;
+            }, BUDGET_LISTE);
+            lues += r.lues;
+            for (const d of r.pages.values()) await ecrireLignes(d.lignes || [], rar === "SH");
+            await retirerDeListe(rar, r.retraits);
+            const ajouts = r.liste.length - local.length + r.retraits.length;
+            ajoutsTotal += ajouts;
+            retraitsTotal += r.retraits.length;
+            if (ajouts || r.retraits.length) journalBase(nomListe(rar) + " : +" + nombre(ajouts) + " / −" + nombre(r.retraits.length) + " (" + pluriel(r.lues, "page lue", "pages lues") + ")");
+        } catch (erreur) {
+            /* trop de changements, ou une liste rangée autrement : on la relit en entier */
+            console.warn("[base] liste " + rar + " relue en entier :", erreur.message);
+            journalBase(nomListe(rar) + " : " + erreur.message + ", relecture complète", "alerte");
+            relues.push(rar);
+            progres("Mise à jour : " + rar + " relue en entier…");
+            await relireListe(rar, etat, (l, p, n) => progres("Mise à jour : " + l + " relue en entier, " + p + " / " + n + "…"), continuer);
+        }
+    }
+    avancer(etapes - 2, etapes, "Mise à jour : échanges, achats et ventes…");
+    lues += await rapprocherDepuisHistorique(etat, progres, continuer);
+    avancer(etapes - 1, etapes, "Mise à jour : étiquettes…");
+    lues += await majEtiquettes(etat, progres, continuer);
+    etat.maj = Date.now();
+    await ecrireEtatBase(etat);
+    avancer(etapes, etapes, "");
+    journalBase("Mise à jour terminée : +" + nombre(ajoutsTotal) + " / −" + nombre(retraitsTotal) + " exemplaire(s), "
+        + pluriel(lues, "requête") + (relues.length ? ", relue(s) en entier : " + relues.map(nomListe).join(", ") : ""), "ok");
+    return {lues, relues};
+}
+
+/* Un échange 1 contre 1 dans le même rang ne change pas les comptes : il passerait inaperçu. Chaque carte échangée,
+   achetée ou vendue depuis la dernière mise à jour est donc vérifiée sur sa fiche (tes exemplaires de cette carte,
+   avec leur date et leur cadenas). Deux lectures d'historique, puis une fiche par carte concernée. */
+async function rapprocherDepuisHistorique(etat, progres, continuer) {
+    const depuis = (etat.majHisto || etat.maj || 0) - 120000;
+    const cids = new Set();
+    let lues = 0;
+    try {
+        const d = await lireJSON("/api/trades?box=history");
+        lues++;
+        for (const e of (d && d.trades) || []) {
+            if (!e || e.status !== "accepted" || enMs(Number(e.closed || e.created) || 0) < depuis) continue;
+            for (const c of [...(e.give || []), ...(e.take || [])]) if (c && c.cid) cids.add(String(c.cid));
+        }
+    } catch (erreur) { /* historique illisible : la vérification complète rattrapera */ }
+    try {
+        const d = await lireJSON("/api/purchases?page=0");
+        lues++;
+        for (const a of (d && d.items) || []) {
+            if (!a || enMs(Number(a.ts) || 0) < depuis) continue;
+            for (const c of (a.lot && Array.isArray(a.lot.cartes) ? a.lot.cartes : [a])) if (c && c.cid) cids.add(String(c.cid));
+        }
+    } catch (erreur) { /* idem */ }
+    let n = 0;
+    if (cids.size) journalBase(pluriel(cids.size, "carte échangée, achetée ou vendue", "cartes échangées, achetées ou vendues") + " depuis la dernière fois : vérifiée(s) sur leur fiche");
+    for (const cid of cids) {
+        if (!continuer()) return lues;
+        progres("Mise à jour : cartes échangées ou vendues, " + (++n) + " / " + cids.size + "…");
+        try {
+            await rapprocherCarte(cid, await lireJSON("/api/card?cid=" + encodeURIComponent(cid)));
+            lues++;
+        } catch (erreur) { /* fiche illisible : la vérification complète rattrapera */ }
+        await pause(CONFIG.pauseMs);
+    }
+    etat.majHisto = Date.now();
+    return lues;
+}
+
+/* aligne la base sur la fiche d'une carte : ses exemplaires partis sont retirés, les nouveaux ajoutés, les dates et
+   cadenas mis à jour */
+async function rapprocherCarte(cid, fiche) {
+    const mine = ((fiche && fiche.mine) || []).filter(m => m && Number.isInteger(m.id));
+    const cache = lireCache();
+    cache.cartes[cid] = entreeDe(fiche);
+    ecrireCache(cache);
+    const infos = infosDeFiche(fiche);
+    const db = await ouvrirBase();
+    const tx = db.transaction("ex", "readwrite");
+    const s = tx.objectStore("ex");
+    const avant = await attendreReq(s.index("cid").getAll(IDBKeyRange.only(cid)));
+    const modele = avant[0] || {cid, n: infos.n || cid, d: infos.d || "", img: infos.img || "", r: infos.r || "C", tags: []};
+    const gardes = new Set(mine.map(m => m.id));
+    for (const a of avant) if (!gardes.has(a.id)) s.delete(a.id);
+    for (const m of mine) {
+        const a = avant.find(x => x.id === m.id);
+        const sh = !!(m.sh || m.shiny);
+        const e = Object.assign({}, a || modele, {id: m.id, cid, sh, t: Number(m.prov && m.prov.ts) || (a && a.t) || 0});
+        if (m.state !== undefined) e.locked = m.state === "locked";
+        if (!a) e.tags = [];
+        if (sh) e.shk = 1;
+        else delete e.shk;
+        s.put(e);
+    }
+    await attendreTx(tx);
+}
+
+/* les étiquettes dont le nombre d'exemplaires a changé sont relues (le résumé du site donne le nombre de chacune) */
+async function majEtiquettes(etat, progres, continuer) {
+    const comptes = etat.resume && etat.resume.etiquettes;
+    if (!comptes || typeof comptes !== "object") return 0;
+    const db = await ouvrirBase();
+    const tagsLocaux = await toutesLesEtiquettesLocales();
+    const aRelire = [];
+    for (const id of new Set([...Object.keys(comptes), ...tagsLocaux].map(String))) {
+        const site = Number(comptes[id]) || 0;
+        const ici = await attendreReq(db.transaction("ex").objectStore("ex").index("tags").count(IDBKeyRange.only(Number(id))));
+        if (site !== ici) {
+            aRelire.push(id);
+            journalBase("Étiquette « " + ((etat.tags || []).find(t => String(t.id) === id) || {name: id}).name + " » : " + nombre(site)
+                + " sur le site, " + nombre(ici) + " dans la base : relue");
+        }
+    }
+    let lues = 0;
+    for (const id of aRelire) {
+        if (!continuer()) break;
+        progres("Mise à jour : étiquette " + ((etat.tags || []).find(t => String(t.id) === id) || {name: id}).name + "…");
+        const vus = new Set();
+        let page = 0, nbPages = 1;
+        while (page < nbPages) {
+            const d = await lirePageListe("", page, id);
+            lues++;
+            await ecrireLignes(d.lignes || [], false);
+            idsDePage(d).forEach(x => vus.add(x));
+            nbPages = Math.max(1, Number(d.pages) || 1);
+            page++;
+            await pause(CONFIG.pauseMs);
+        }
+        /* ceux qui portaient l'étiquette et ne la portent plus */
+        const avant = await attendreReq(db.transaction("ex").objectStore("ex").index("tags").getAllKeys(IDBKeyRange.only(Number(id))));
+        await modifierEtiquetteRetiree(avant.filter(x => !vus.has(x)), Number(id));
+    }
+    return lues;
+}
+
+async function toutesLesEtiquettesLocales() {
+    const db = await ouvrirBase();
+    const index = db.transaction("ex").objectStore("ex").index("tags");
+    const tags = new Set();
+    await new Promise((ok, ko) => {
+        const c = index.openKeyCursor(null, "nextunique");
+        c.onsuccess = () => {
+            const curseur = c.result;
+            if (!curseur) return ok();
+            tags.add(curseur.key);
+            curseur.continue();
+        };
+        c.onerror = () => ko(c.error);
+    });
+    return [...tags];
+}
+
+async function modifierEtiquetteRetiree(ids, tag) {
+    if (!ids.length) return;
+    const db = await ouvrirBase();
+    const tx = db.transaction("ex", "readwrite");
+    const s = tx.objectStore("ex");
+    for (const id of ids) {
+        const lecture = s.get(id);
+        lecture.onsuccess = () => {
+            const a = cloner(lecture.result);
+            if (!a) return;
+            a.tags = (a.tags || []).filter(t => t !== tag);
+            s.put(a);
+        };
+    }
+    await attendreTx(tx);
+}
+
+/* « Tout vérifier » : chaque liste relue en entier, puis les étiquettes */
+async function verifierToutBase(progres, continuer) {
+    const etat = await lireEtatBase();
+    journalBase("Vérification complète : début");
+    const prevues = pagesPrevues(etat);
+    let faites = 0;
+    for (const rar of LISTES_BASE) {
+        const ok = await relireListe(rar, etat, (l, p, n) => {
+            avancer(++faites, Math.max(prevues, faites), "Vérification : " + nomListe(l) + ", page " + p + " / " + n);
+            progres("Vérification : " + l + " " + p + " / " + n + "…");
+        }, continuer);
+        if (!ok) {
+            journalBase("Vérification interrompue", "alerte");
+            return false;
+        }
+    }
+    await majEtiquettes(etat, progres, continuer);
+    etat.maj = etat.complet = Date.now();
+    await ecrireEtatBase(etat);
+    journalBase("Vérification complète terminée : " + pluriel(await compterBase(), "exemplaire"), "ok");
+    avancer(1, 1, "");
+    return true;
+}
+
+/* les dates déjà lues par le tri (cache wpx.tri.dates2) passent dans la base */
+async function reprendreDatesDuCache() {
+    const cache = lireCache();
+    const modifs = [];
+    for (const e of Object.values(cache.cartes)) {
+        for (const [id, t] of Object.entries((e && e.ex) || {})) if (t) modifs.push([+id, {t}]);
+    }
+    for (let i = 0; i < modifs.length; i += 2000) await modifierExemplaires(modifs.slice(i, i + 2000));
+}
+
+/* un seul onglet travaille sur la base à la fois ; null si un autre s'en occupe */
+async function avecBase(travail) {
+    if (BASE.occupe) return null;
+    const faire = async () => {
+        BASE.occupe = true;
+        BASE.erreur = "";
+        majPanneauBase();
+        try {
+            return await travail();
+        } catch (erreur) {
+            BASE.erreur = erreur.message;
+            journalBase("Erreur : " + erreur.message, "erreur");
+            throw erreur;
+        } finally {
+            avancer(0, 0, "");
+            BASE.occupe = false;
+            majPanneauBase();
+        }
+    };
+    if (!navigator.locks) return faire();
+    return navigator.locks.request("wpx-base", {ifAvailable: true}, verrou => (verrou ? faire() : null));
+}
+
+/* les plus grands identifiants de la base (les exemplaires les plus récemment créés) */
+async function plusGrandsIdentifiants(n) {
+    const db = await ouvrirBase();
+    const s = db.transaction("ex").objectStore("ex");
+    const liste = [];
+    await new Promise((ok, ko) => {
+        const c = s.openCursor(null, "prev");
+        c.onsuccess = () => {
+            const curseur = c.result;
+            if (!curseur || liste.length >= n) return ok();
+            liste.push(cloner(curseur.value));
+            curseur.continue();
+        };
+        c.onerror = () => ko(c.error);
+    });
+    return liste;
+}
+
+async function exemplairesDeCartes(cids) {
+    const db = await ouvrirBase();
+    const index = db.transaction("ex").objectStore("ex").index("cid");
+    const parCid = new Map();
+    for (const cid of new Set(cids)) parCid.set(cid, await attendreReq(index.getAll(IDBKeyRange.only(cid))));
+    return parCid;
+}
+
+async function compterBase() {
+    const db = await ouvrirBase();
+    return attendreReq(db.transaction("ex").objectStore("ex").count());
+}
+
+/* export et import d'une copie de la base, en fichier JSON */
+async function exporterBase() {
+    const db = await ouvrirBase();
+    const ex = await attendreReq(db.transaction("ex").objectStore("ex").getAll());
+    const etat = await lireEtatBase();
+    const blob = new Blob([JSON.stringify({v: 1, quand: Date.now(), joueur: pseudoJoueur(), etat, ex})], {type: "application/json"});
+    const url = URL.createObjectURL(blob);
+    const d = new Date();
+    const lien = el("a", {href: url, download: "wikipick_base_" + d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-"
+        + String(d.getDate()).padStart(2, "0") + ".json"});
+    D.body.append(lien);
+    lien.click();
+    lien.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    return ex.length;
+}
+
+async function importerBase(fichier) {
+    const donnees = JSON.parse(await fichier.text());
+    if (!donnees || !Array.isArray(donnees.ex) || !donnees.etat) throw new Error("ce fichier n'est pas une base exportée");
+    const db = await ouvrirBase();
+    const vide = db.transaction("ex", "readwrite");
+    vide.objectStore("ex").clear();
+    await attendreTx(vide);
+    for (let i = 0; i < donnees.ex.length; i += 2000) {
+        const tx = db.transaction("ex", "readwrite");
+        const s = tx.objectStore("ex");
+        for (const e of donnees.ex.slice(i, i + 2000)) if (e && Number.isInteger(e.id)) s.put(e);
+        await attendreTx(tx);
+    }
+    await ecrireEtatBase(donnees.etat);
+    return donnees.ex.length;
+}
+
+/* Les cadenas posés depuis le site (sa fiche) ou depuis tes outils : un petit relais dans la page voit passer les
+   demandes de verrouillage réussies, et la base les note (aucune requête de plus). */
+function relaisCadenas() {
+    if (window.__wpxRelaisCadenas) return;
+    window.__wpxRelaisCadenas = true;
+    const precedent = window.fetch;
+    window.fetch = function (entree, options) {
+        const promesse = Reflect.apply(precedent, this, arguments);
+        try {
+            const adresse = new URL(typeof entree === "string" ? entree : entree && entree.url ? entree.url : String(entree), location.href);
+            if (adresse.origin === location.origin && /^\/api\/card\/lock(\/bulk)?$/.test(adresse.pathname) && options && typeof options.body === "string") {
+                const corps = JSON.parse(options.body);
+                const ids = Array.isArray(corps.ids) ? corps.ids : corps.card_id != null ? [corps.card_id] : [];
+                promesse.then(r => {
+                    if (r.ok && ids.length) document.dispatchEvent(new CustomEvent("wpx-base-cadenas", {detail: JSON.stringify({ids, on: !!corps.on})}));
+                }).catch(() => {});
+            }
+        } catch (erreur) { /* demande illisible : la requête part quand même */ }
+        return promesse;
+    };
+}
+
+function installerRelaisCadenas() {
+    D.addEventListener("wpx-base-cadenas", e => {
+        try {
+            const {ids, on} = JSON.parse(e.detail);
+            modifierExemplaires(ids.filter(Number.isInteger).map(id => [id, {locked: on}])).catch(() => {});
+            for (const x of DER.elements) if (ids.includes(x.id)) x.locked = on;
+        } catch (erreur) { /* rien */ }
+    });
+    const script = D.createElement("script");
+    script.textContent = "(" + relaisCadenas + ")();";
+    (D.head || D.documentElement).append(script);
+    script.remove();
+}
+
+/* ==========================================================================
    MES DERNIÈRES CARTES : LA FENÊTRE
    ========================================================================== */
 const DER = {vue: null, z: null, elements: [], infos: {tags: [], aVendre: new Set(), imgp: []}, choix: new Set(),
@@ -550,11 +1227,49 @@ function construireDernieres() {
         el("span", {class: "wpx-dn-groupe"}, "Étiquette ", z.etiquette, z.poser, z.retirer),
         el("span", {class: "wpx-dn-groupe"}, z.verrouiller, z.deverrouiller),
         el("span", {class: "wpx-dn-groupe"}, z.vendre, z.arreter));
+    /* (2.0) la base de la collection : son état et ses boutons */
+    z.base = el("div", {class: "wpx-dn-base"});
+    z.baseTexte = el("span", {class: "wpx-dn-base-texte", "aria-live": "polite"});
+    z.bConstruire = el("button", {type: "button", class: "wpx-dn-btn", title: "Lire toute ta collection une fois (30 à 40 minutes, reprenable) ; ensuite seules les différences sont lues"}, "Construire la base");
+    z.bPause = el("button", {type: "button", class: "wpx-dn-btn", hidden: true, title: "Mettre en pause : la lecture reprend où elle s'est arrêtée"}, "Pause");
+    z.bMaj = el("button", {type: "button", class: "wpx-dn-btn", title: "Lire seulement ce qui a changé depuis la dernière fois"}, "Mettre à jour");
+    z.bVerifier = el("button", {type: "button", class: "wpx-dn-btn", title: "Tout relire (30 à 40 minutes) : rattrape les changements qui se compensent"}, "Tout vérifier");
+    z.bExporter = el("button", {type: "button", class: "wpx-dn-lien", title: "Télécharger une copie de la base (fichier JSON)"}, "Exporter");
+    z.bImporter = el("button", {type: "button", class: "wpx-dn-lien", title: "Remplacer la base par une copie exportée"}, "Importer");
+    z.fichier = el("input", {type: "file", accept: ".json,application/json", hidden: true});
+    z.base.append(el("b", null, "Base"), z.baseTexte, z.bConstruire, z.bPause, z.bMaj, z.bVerifier, z.bExporter, z.bImporter, z.fichier);
+    z.bConstruire.addEventListener("click", () => lancerConstruction());
+    z.bPause.addEventListener("click", () => {
+        BASE.pause = true;
+        lireEtatBase().then(e => { if (e.init) { e.init.enCours = false; return ecrireEtatBase(e); } }).catch(() => {});
+    });
+    z.bMaj.addEventListener("click", () => {
+        avecBase(() => majBaseDifferences(texte => majPanneauBase(texte), () => !BASE.pause))
+            .then(r => majPanneauBase(r ? "À jour (" + pluriel(r.lues, "page lue", "pages lues") + (r.relues && r.relues.length ? ", relue(s) en entier : " + r.relues.join(", ") : "") + ")" : "Un autre onglet travaille déjà sur la base."))
+            .catch(e => majPanneauBase("Erreur : " + e.message));
+    });
+    z.bVerifier.addEventListener("click", () => {
+        if (!confirm("Tout relire ? Toute la collection est relue (30 à 40 minutes), par petits lots. Tu peux continuer à jouer pendant ce temps.")) return;
+        BASE.pause = false;
+        avecBase(() => verifierToutBase(texte => majPanneauBase(texte), () => !BASE.pause))
+            .then(() => majPanneauBase()).catch(e => majPanneauBase("Erreur : " + e.message));
+    });
+    z.bExporter.addEventListener("click", () => exporterBase().then(n => majPanneauBase(pluriel(n, "exemplaire") + " exporté(s).")).catch(e => majPanneauBase("Erreur : " + e.message)));
+    z.bImporter.addEventListener("click", () => z.fichier.click());
+    z.fichier.addEventListener("change", () => {
+        const f = z.fichier.files && z.fichier.files[0];
+        z.fichier.value = "";
+        if (!f || !confirm("Remplacer ta base par « " + f.name + " » ?")) return;
+        avecBase(() => importerBase(f)).then(n => majPanneauBase(n != null ? pluriel(n, "exemplaire") + " importé(s)." : "Un autre onglet travaille déjà sur la base."))
+            .catch(e => majPanneauBase("Erreur : " + e.message));
+    });
+
     DER.vue = el("aside", {id: "wpx-dn", "data-wpx": "", role: "dialog", "aria-label": T.dernieres, hidden: true},
         el("header", {class: "wpx-dn-tete"}, el("b", null, T.dernieres), z.nombre, z.charger, z.etat, z.images, z.fermer),
-        z.actions, z.corps, z.lien);
+        z.base, z.actions, z.corps, z.lien);
     DER.z = z;
     D.body.append(DER.vue);
+    majPanneauBase();
 
     z.fermer.addEventListener("click", fermerDernieres);
     z.charger.addEventListener("click", chargerDernieres);
@@ -618,6 +1333,269 @@ function etat(texte) {
     if (DER.z && DER.z.etat.textContent !== texte) DER.z.etat.textContent = texte;
 }
 
+/* L'état de la base, dans la fenêtre des dernières cartes et dans le tableau de bord de l'en-tête ; texte : un message
+   du moment (progression, résultat). Statut : vert (prête), orange (travail en cours), rouge (pas construite, en
+   pause, ou une erreur). */
+const ilYaMin = t => {
+    const m = Math.round((Date.now() - t) / 60000);
+    return m < 1 ? "à l'instant" : m < 60 ? "il y a " + m + " min" : m < 1440 ? "il y a " + Math.round(m / 60) + " h" : "il y a " + Math.round(m / 1440) + " j";
+};
+
+async function infosBase() {
+    const e = await lireEtatBase();
+    const n = await compterBase();
+    const prete = baseInitialisee(e);
+    const enConstruction = !!(e.init && !e.init.fini);
+    let texte, statut;
+    if (BASE.erreur) {
+        statut = "rouge";
+        texte = "erreur : " + BASE.erreur;
+    } else if (prete) {
+        statut = BASE.occupe ? "orange" : "vert";
+        texte = pluriel(n, "exemplaire") + " · à jour " + ilYaMin(e.maj || e.init.fini)
+            + (e.complet && Date.now() - e.complet > 7 * 86400e3 ? " · dernière vérification complète " + ilYaMin(e.complet) + " : pense à « Tout vérifier »" : "");
+    } else if (enConstruction) {
+        statut = BASE.occupe ? "orange" : "rouge";
+        texte = "construction : " + nombre(pagesFaites(e)) + " / ~" + nombre(pagesPrevues(e)) + " pages, " + pluriel(n, "exemplaire") + (BASE.occupe ? "" : " (en pause)");
+    } else {
+        statut = "rouge";
+        texte = "pas encore construite";
+    }
+    return {e, n, prete, enConstruction, texte, statut};
+}
+
+async function majPanneauBase(texte) {
+    if (!DER.z && !TB.vue && !TB.bouton) return;
+    let i;
+    try {
+        i = await infosBase();
+    } catch (erreur) {
+        i = {e: {}, n: 0, prete: false, enConstruction: false, statut: "rouge", texte: "indisponible dans ce navigateur (" + erreur.message + ")"};
+    }
+    const z = DER.z;
+    if (z) {
+        z.baseTexte.textContent = (i.prete || i.enConstruction || BASE.erreur ? i.texte : "pas encore construite : « Mes dernières cartes » lit le site à chaque fois")
+            + (texte ? " · " + texte : "");
+        z.bConstruire.hidden = i.prete || (i.enConstruction && BASE.occupe);
+        z.bConstruire.textContent = i.enConstruction ? "Reprendre la construction" : "Construire la base";
+        z.bPause.hidden = !(i.enConstruction && BASE.occupe);
+        z.bMaj.hidden = z.bVerifier.hidden = !i.prete;
+        z.bExporter.hidden = !i.n;
+        [z.bConstruire, z.bMaj, z.bVerifier, z.bImporter].forEach(b => { b.disabled = BASE.occupe; });
+    }
+    majTableauBord(i, texte);
+}
+
+/* la construction (ou sa reprise), en tâche de fond ; elle reprendra seule au prochain chargement tant qu'elle n'est
+   pas mise en pause */
+function lancerConstruction() {
+    BASE.pause = false;
+    return avecBase(async () => {
+        const e = await lireEtatBase();
+        if (!e.init) e.init = {debut: Date.now(), listes: {}};
+        e.init.enCours = true;
+        await ecrireEtatBase(e);
+        majPanneauBase();
+        const fini = await initialiserBase(() => majPanneauBase(), () => !BASE.pause);
+        if (fini) majPanneauBase("construite.");
+    }).catch(erreur => majPanneauBase("Erreur : " + erreur.message + " (la construction reprendra où elle s'est arrêtée)"));
+}
+
+/* ==========================================================================
+   (2.1) LE TABLEAU DE BORD DE LA BASE, DANS L'EN-TÊTE
+   Un bouton à côté de Clean, Largeur et des réglages du script principal (avec une pastille verte, orange ou rouge),
+   qui ouvre un panneau : le statut, la barre de progression, les boutons (construire, pause, mettre à jour, tout
+   vérifier, exporter, importer) et le journal.
+   ========================================================================== */
+const TB = {bouton: null, vue: null, z: null};
+const ICONE_BASE = `<svg class="wpx-ico" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="8" ry="3"/>`
+    + `<path d="M4 8.2c1.5 1.6 4.6 2.5 8 2.5s6.5-.9 8-2.5v3.6c0 1.7-3.6 3-8 3s-8-1.3-8-3z"/><path d="M4 14.4c1.5 1.6 4.6 2.5 8 2.5s6.5-.9 8-2.5v3.6c0 1.7-3.6 3-8 3s-8-1.3-8-3z"/></svg>`;
+
+/* (2.4) le bouton n'apparaît que dans Collection > Mes étiquettes (le travail en cours, lui, continue ailleurs) */
+function majVisibiliteBouton() {
+    if (!TB.bouton) return;
+    const ici = !!$("#v-coll.on") && !!$('#ctabs button[data-c="album"].on');
+    if (TB.bouton.hidden === !ici) return;
+    TB.bouton.hidden = !ici;
+    if (!ici) fermerTableauBord();
+}
+
+function installerBoutonBase() {
+    majVisibiliteBouton();
+    if (TB.bouton && TB.bouton.isConnected) return;
+    const rangee = $("body > header.top .row1");
+    if (!rangee) return;
+    const repere = rangee.querySelector(":scope > [data-wpx-reglages]") || rangee.querySelector(":scope > [data-wpx-bascule]")
+        || rangee.querySelector(":scope > [data-nuit-bascule]") || rangee.querySelector(":scope > [data-theme-bascule]");
+    if (!TB.bouton) {
+        TB.bouton = el("button", {type: "button", class: "wpx-crane wpx-tb-bouton", "data-wpx": "", "aria-haspopup": "dialog",
+            "aria-label": "Base de la collection", title: "Base de la collection : construction, mise à jour, journal"});
+        TB.bouton.innerHTML = ICONE_BASE + '<i class="wpx-tb-pastille" aria-hidden="true"></i>';
+        TB.bouton.addEventListener("click", () => (TB.vue && !TB.vue.hidden ? fermerTableauBord() : ouvrirTableauBord()));
+    }
+    if (repere) repere.after(TB.bouton);
+    else rangee.append(TB.bouton);
+    majVisibiliteBouton();
+    majPanneauBase();
+}
+
+function construireTableauBord() {
+    const z = {
+        pastille: el("i", {class: "wpx-tb-pastille"}),
+        statut: el("b", {class: "wpx-tb-statut"}),
+        detail: el("span", {class: "wpx-tb-detail"}),
+        barre: el("div", {class: "wpx-tb-barre"}),
+        progres: el("small", {class: "wpx-tb-progres"}),
+        fermer: el("button", {type: "button", class: "wpx-dn-x", title: "Fermer (Échap)", "aria-label": "Fermer"}, "✕"),
+        construire: el("button", {type: "button", class: "wpx-dn-btn wpx-dn-plein"}, "Construire la base"),
+        pause: el("button", {type: "button", class: "wpx-dn-btn"}, "Pause"),
+        maj: el("button", {type: "button", class: "wpx-dn-btn"}, "Mettre à jour"),
+        verifier: el("button", {type: "button", class: "wpx-dn-btn"}, "Tout vérifier"),
+        exporter: el("button", {type: "button", class: "wpx-dn-lien"}, "Exporter"),
+        importer: el("button", {type: "button", class: "wpx-dn-lien"}, "Importer"),
+        journal: el("div", {class: "wpx-tb-journal", "aria-live": "polite"}),
+        copier: el("button", {type: "button", class: "wpx-dn-lien"}, "Copier le journal"),
+        vider: el("button", {type: "button", class: "wpx-dn-lien"}, "Vider le journal")
+    };
+    z.remplissage = el("i");
+    z.barre.append(z.remplissage);
+    TB.vue = el("aside", {id: "wpx-tb", "data-wpx": "", role: "dialog", "aria-label": "Base de la collection", hidden: true},
+        el("header", {class: "wpx-tb-tete"}, el("b", null, "Base de la collection"), z.fermer),
+        el("div", {class: "wpx-tb-etat"}, z.pastille, z.statut, z.detail),
+        z.barre, z.progres,
+        el("div", {class: "wpx-tb-boutons"}, z.construire, z.pause, z.maj, z.verifier, z.exporter, z.importer),
+        el("div", {class: "wpx-tb-jtete"}, el("b", null, "Journal"), z.copier, z.vider),
+        z.journal);
+    TB.z = z;
+    D.body.append(TB.vue);
+    z.fermer.addEventListener("click", fermerTableauBord);
+    /* les boutons font la même chose que ceux de la fenêtre des dernières cartes */
+    const fenetre = () => {
+        if (!DER.vue) construireDernieres();
+        return DER.z;
+    };
+    z.construire.addEventListener("click", () => lancerConstruction());
+    z.pause.addEventListener("click", () => fenetre().bPause.click());
+    z.maj.addEventListener("click", () => fenetre().bMaj.click());
+    z.verifier.addEventListener("click", () => fenetre().bVerifier.click());
+    z.exporter.addEventListener("click", () => fenetre().bExporter.click());
+    z.importer.addEventListener("click", () => fenetre().bImporter.click());
+    z.copier.addEventListener("click", async () => {
+        const texte = JB.lignes.map(l => "[" + new Date(l[0]).toLocaleString("fr-FR") + "] " + l[1]).join("\n");
+        try {
+            await navigator.clipboard.writeText(texte);
+            z.copier.textContent = "Copié ✓";
+        } catch (erreur) {
+            z.copier.textContent = "Copie impossible";
+        }
+        setTimeout(() => { z.copier.textContent = "Copier le journal"; }, 2000);
+    });
+    z.vider.addEventListener("click", () => {
+        JB.lignes.length = 0;
+        try { sessionStorage.removeItem("wpx.base.journal"); } catch (erreur) { /* rien */ }
+        remplirJournalBase();
+    });
+    D.addEventListener("pointerdown", e => {
+        if (!TB.vue.hidden && !TB.vue.contains(e.target) && !TB.bouton.contains(e.target)) fermerTableauBord();
+    }, true);
+    remplirJournalBase();
+}
+
+function ouvrirTableauBord() {
+    if (!TB.vue) construireTableauBord();
+    TB.vue.hidden = false;
+    TB.bouton.setAttribute("aria-expanded", "true");
+    majPanneauBase();
+    majBarreBase();
+    TB.z.journal.scrollTop = TB.z.journal.scrollHeight;
+}
+
+function fermerTableauBord() {
+    if (!TB.vue || TB.vue.hidden) return;
+    TB.vue.hidden = true;
+    TB.bouton.setAttribute("aria-expanded", "false");
+}
+
+const ligneJournal = l => el("div", {class: "wpx-tb-l" + (l[2] ? " wpx-tb-" + l[2] : "")},
+    el("time", null, new Date(l[0]).toLocaleTimeString("fr-FR", {hour: "2-digit", minute: "2-digit", second: "2-digit"})), " ", l[1]);
+
+function remplirJournalBase() {
+    if (!TB.z) return;
+    TB.z.journal.replaceChildren(...(JB.lignes.length ? JB.lignes.map(ligneJournal) : [el("div", {class: "wpx-tb-l wpx-tb-vide"}, "Rien pour l'instant.")]));
+    TB.z.journal.scrollTop = TB.z.journal.scrollHeight;
+}
+
+function ajouterAuJournal(l) {
+    if (!TB.z) return;
+    const vide = $(".wpx-tb-vide", TB.z.journal);
+    if (vide) vide.remove();
+    const enBas = TB.z.journal.scrollHeight - TB.z.journal.scrollTop - TB.z.journal.clientHeight < 30;
+    TB.z.journal.append(ligneJournal(l));
+    while (TB.z.journal.childElementCount > 500) TB.z.journal.firstChild.remove();
+    if (enBas) TB.z.journal.scrollTop = TB.z.journal.scrollHeight;
+}
+
+/* la barre : la progression du travail en cours (pleine et immobile quand rien ne tourne) */
+function majBarreBase() {
+    if (!TB.z) return;
+    const p = BASE.progres || {};
+    const pct = p.total ? Math.min(100, Math.round(p.fait / p.total * 100)) : BASE.occupe ? 0 : 100;
+    TB.z.remplissage.style.width = pct + "%";
+    TB.z.barre.classList.toggle("wpx-tb-actif", !!BASE.occupe);
+    TB.z.progres.textContent = BASE.occupe ? (p.texte || "En cours…") + (p.total ? " · " + pct + " %" : "") : "";
+}
+
+function majTableauBord(i, texte) {
+    const statut = BASE.occupe ? "orange" : i.statut;
+    if (TB.bouton) {
+        TB.bouton.dataset.statut = statut;
+        TB.bouton.title = "Base de la collection : " + i.texte;
+    }
+    if (!TB.z) return;
+    const z = TB.z;
+    z.pastille.dataset.statut = statut;
+    z.statut.textContent = statut === "vert" ? "Prête" : statut === "orange" ? "En cours" : BASE.erreur ? "Erreur" : i.enConstruction ? "En pause" : "Pas construite";
+    z.detail.textContent = i.texte + (texte ? " · " + texte : "");
+    z.construire.hidden = i.prete || (i.enConstruction && BASE.occupe);
+    z.construire.textContent = i.enConstruction ? "Reprendre la construction" : "Construire la base";
+    z.pause.hidden = !(i.enConstruction && BASE.occupe);
+    z.maj.hidden = z.verifier.hidden = !i.prete;
+    z.exporter.hidden = !i.n;
+    [z.construire, z.maj, z.verifier, z.importer].forEach(b => { b.disabled = BASE.occupe; });
+    majBarreBase();
+}
+
+/* au chargement : une construction commencée (et pas en pause) reprend, sans attendre l'ouverture de la fenêtre */
+async function reprendreConstruction() {
+    try {
+        const e = await lireEtatBase();
+        if (e.init && !e.init.fini && e.init.enCours) lancerConstruction();
+    } catch (erreur) { /* base indisponible : rien */ }
+}
+
+/* un exemplaire de la base, au format de la fenêtre */
+const elementDeBase = (r, imgp) => ({id: r.id, cid: r.cid, n: r.n, d: r.d, img: urlImage(r.img, imgp || []), r: r.r,
+    locked: !!r.locked, tags: (r.tags || []).slice(), sh: !!r.sh, hw: false, tBase: r.t || 0});
+
+/* (2.0) Les candidats : dans la base si elle est prête (mise à jour d'abord si elle date de plus de 2 minutes, en
+   quelques requêtes), sinon sur le site, comme avant */
+async function candidatsDernieres(n, continuer) {
+    const etatBase = await lireEtatBase().catch(() => null);
+    if (baseInitialisee(etatBase)) {
+        if (Date.now() - (etatBase.maj || 0) > 2 * 60000) {
+            etat("Mise à jour de la base…");
+            await avecBase(() => majBaseDifferences(texte => etat(texte), continuer));      // un autre onglet s'en occupe : on lit la base telle quelle
+        }
+        const e = BASE.etat || etatBase;
+        const imgp = e.imgp || [];
+        const tous = (await plusGrandsIdentifiants(n + DN.marge)).map(r => elementDeBase(r, imgp));
+        return {tous, infos: {tags: e.tags || [], aVendre: new Set(), imgp}, base: true};
+    }
+    etat("Lecture de la collection…");
+    const r = await candidatsParIdentifiant(n, continuer, lues => etat("Lecture de la collection… " + lues + " page(s)"));
+    return Object.assign(r, {base: false});
+}
+
 async function chargerDernieres() {
     if (DER.lot) return;
     const z = DER.z;
@@ -628,15 +1606,15 @@ async function chargerDernieres() {
     const continuer = () => jeton === DER.jeton;
     z.charger.disabled = true;
     try {
-        etat("Lecture de la collection…");
-        const {tous, infos} = await candidatsParIdentifiant(n, continuer, lues => etat("Lecture de la collection… " + lues + " page(s)"));
+        const {tous, infos, base} = await candidatsDernieres(n, continuer);
         if (!continuer()) return;
         DER.infos = infos;
         etat("Lecture de tes échanges et achats…");
         const historique = await candidatsHistorique(n);
         if (!continuer()) return;
-        /* une carte sans image dans la liste du site (et celles de l'historique) : l'image vient de sa fiche */
-        const demandes = tous.map(x => ({cid: x.cid, id: x.id, infos: !x.img}))
+        /* une carte déjà datée dans la base n'a pas besoin de sa fiche ; une carte sans image (et celles de
+           l'historique) prend la sienne sur sa fiche */
+        const demandes = tous.filter(x => !x.tBase).map(x => ({cid: x.cid, id: x.id, infos: !x.img}))
             .concat(historique.map(h => ({cid: h.cid, frais: DN.histoFrais, infos: true})));
         const rates = await lireFiches(demandes, continuer, (fait, total) => etat("Dates : " + fait + " / " + total + "…"));
         if (!continuer()) return;
@@ -644,6 +1622,7 @@ async function chargerDernieres() {
         /* chaque exemplaire, daté par sa fiche ; ceux de l'historique ne sont gardés que s'ils sont encore à toi */
         const cache = lireCache();
         const elements = new Map(tous.map(x => [x.id, x]));
+        const dansBase = base ? await exemplairesDeCartes(historique.map(h => h.cid)) : new Map();
         for (const h of historique) {
             const e = cache.cartes[h.cid];
             if (!e || !e.ex) continue;
@@ -652,13 +1631,14 @@ async function chargerDernieres() {
                 if (elements.has(+id)) continue;
                 const fl = e.fl && e.fl[id] != null ? e.fl[id] : ids.length === 1 ? (h.sh ? 1 : 0) + (h.hw ? 2 : 0) : null;
                 if (fl != null && (!!(fl & 1) !== h.sh || !!(fl & 2) !== h.hw)) continue;     // une autre version de la carte
-                elements.set(+id, {id: +id, cid: h.cid, n: h.n, d: "", img: h.img || "", r: h.r, locked: false, tags: [],
-                    sh: h.sh, hw: h.hw, partiel: true});
+                const r = (dansBase.get(h.cid) || []).find(x => x.id === +id);
+                elements.set(+id, r ? elementDeBase(r, infos.imgp)
+                    : {id: +id, cid: h.cid, n: h.n, d: "", img: h.img || "", r: h.r, locked: false, tags: [], sh: h.sh, hw: h.hw, partiel: true});
             }
         }
         const date = x => {
             const e = cache.cartes[x.cid];
-            return (e && e.ex && e.ex[String(x.id)]) || 0;
+            return (e && e.ex && e.ex[String(x.id)]) || x.tBase || 0;
         };
         /* ce qui manque à une carte (image, description, nom) est repris de sa fiche */
         const completer = x => {
@@ -1015,6 +1995,53 @@ function installerStyles() {
 .wpx-dn-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px 18px;padding:10px 16px;border-bottom:1px solid var(--wpx-bord,rgba(167,139,250,.16));font-size:12.5px;color:var(--wpx-doux,#9a93b3)}
 .wpx-dn-groupe{display:inline-flex;align-items:center;gap:6px}
 #wpx-dn .wpx-dn-actions select{width:190px}
+.wpx-dn-base{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:8px 16px;border-bottom:1px solid var(--wpx-bord,rgba(167,139,250,.16));
+  font-size:12.5px;color:var(--wpx-doux,#9a93b3)}
+.wpx-dn-base>b{font:800 12.5px Sora,Inter,sans-serif;color:var(--wpx-encre,#ece9f6)}
+.wpx-dn-base-texte{flex:1 1 260px}
+.wpx-dn-base .wpx-dn-btn{height:28px;padding:0 10px;font-size:12px}
+.wpx-dn-base [hidden]{display:none}
+.wpx-tb-bouton{position:relative;flex:0 0 auto;width:32px;height:40px;display:grid;place-items:center;padding:0;background:none;border:0;color:#cfc8e2;cursor:pointer}
+.wpx-tb-bouton .wpx-ico{display:block;width:21px;height:21px}
+.wpx-tb-bouton:hover{color:#fff}
+.wpx-tb-bouton[hidden]{display:none!important}
+.wpx-tb-bouton[aria-expanded="true"]{color:var(--wpx-accent,#c4b5fd)}
+.wpx-tb-pastille{display:inline-block;flex:0 0 auto;width:10px;height:10px;border-radius:50%;background:#ef4444;box-shadow:0 0 8px rgba(239,68,68,.7)}
+.wpx-tb-bouton .wpx-tb-pastille{position:absolute;right:1px;top:8px;width:8px;height:8px;border:1.5px solid var(--bg,#06040b)}
+.wpx-tb-bouton[data-statut="vert"] .wpx-tb-pastille,.wpx-tb-pastille[data-statut="vert"]{background:#22c55e;box-shadow:0 0 8px rgba(34,197,94,.7)}
+.wpx-tb-bouton[data-statut="orange"] .wpx-tb-pastille,.wpx-tb-pastille[data-statut="orange"]{background:#f59e0b;box-shadow:0 0 8px rgba(245,158,11,.7);animation:wpxTbPouls 1.2s ease-in-out infinite}
+@keyframes wpxTbPouls{50%{opacity:.35}}
+@media (max-width:700px){.row1>.wpx-tb-bouton{display:none}}
+#wpx-tb{position:fixed;z-index:94;top:calc(var(--wpx-entete-bas,64px) + 8px);right:12px;width:min(470px,calc(100vw - 24px));
+  max-height:calc(100vh - var(--wpx-entete-bas,64px) - 24px);display:flex;flex-direction:column;gap:9px;padding:14px 16px;
+  background:var(--wpx-plein,#110b1e);color:var(--wpx-encre,#ece9f6);border:1px solid var(--wpx-bord2,rgba(167,139,250,.32));border-radius:16px;
+  box-shadow:0 30px 90px -20px #000;font:500 13px/1.45 Inter,system-ui,sans-serif}
+#wpx-tb[hidden]{display:none}
+.wpx-tb-tete{display:flex;align-items:center;gap:10px}
+.wpx-tb-tete>b{font:800 16px Sora,Inter,sans-serif}
+.wpx-tb-tete .wpx-dn-x{margin-left:auto}
+.wpx-tb-etat{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.wpx-tb-statut{font:800 13.5px Sora,Inter,sans-serif}
+.wpx-tb-detail{flex:1 1 100%;color:var(--wpx-doux,#9a93b3);font-size:12.5px}
+.wpx-tb-barre{height:9px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden}
+.wpx-tb-barre>i{display:block;height:100%;width:0;border-radius:99px;background:var(--wpx-degrade,linear-gradient(135deg,#7c3aed,#c026d3));transition:width .3s ease}
+.wpx-tb-barre:not(.wpx-tb-actif)>i{background:#22c55e;opacity:.55}
+.wpx-tb-barre.wpx-tb-actif>i{background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.18) 0 8px,transparent 8px 16px),var(--wpx-degrade,linear-gradient(135deg,#7c3aed,#c026d3));
+  background-size:22px 22px,100% 100%;animation:wpxTbRayures .8s linear infinite}
+@keyframes wpxTbRayures{to{background-position:22px 0,0 0}}
+.wpx-tb-progres{min-height:1.3em;margin-top:-4px;color:var(--wpx-doux,#9a93b3);font-size:11.5px}
+.wpx-tb-boutons{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.wpx-tb-boutons [hidden]{display:none}
+.wpx-tb-jtete{display:flex;align-items:center;gap:6px;margin-top:2px}
+.wpx-tb-jtete>b{margin-right:auto;font:800 12.5px Sora,Inter,sans-serif}
+.wpx-tb-journal{flex:1 1 auto;min-height:120px;max-height:280px;overflow:auto;overscroll-behavior:contain;padding:8px 10px;border-radius:10px;
+  background:rgba(0,0,0,.28);font:11px/1.55 ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+.wpx-tb-l time{color:var(--wpx-pale,#6b6485)}
+.wpx-tb-ok{color:#86efac}
+.wpx-tb-alerte{color:#fde68a}
+.wpx-tb-erreur{color:#fca5a5}
+.wpx-tb-vide{color:var(--wpx-pale,#6b6485)}
+@media (prefers-reduced-motion:reduce){.wpx-tb-pastille,.wpx-tb-barre>i{animation:none!important}}
 .wpx-dn-compte{min-width:80px}
 .wpx-dn-corps{flex:1;min-height:0;overflow:auto;padding:14px 16px 20px;overscroll-behavior:contain}
 .wpx-dn-vide{color:var(--wpx-pale,#6b6485);text-align:center}
@@ -1097,23 +2124,31 @@ function construireInterface() {
     TRI.ui = {racine: ui, choix, etiquette, statut: zoneStatut};
 }
 
-/* posée, reposée si le site redessine ses outils, cachée hors de la grille des cartes */
-function majInterface(g) {
+/* (2.5) Posée à côté de « Sélectionner », reposée dès qu'elle n'y est plus (le site redessine ses outils quand on
+   revient dans Ma collection), et affichée sur Ma collection hors de l'onglet Étiquettes, que la grille soit déjà
+   dessinée ou non. Aussi vérifié chaque seconde : un redessin qui passerait inaperçu ne la fait plus disparaître. */
+function majInterface() {
+    const vue = $("#v-coll");
+    const onglet = $("#ctabs button.on");
+    const ici = !!vue && vue.classList.contains("on") && !(onglet && onglet.dataset.c === "album");
     if (!TRI.ui) {
-        if (!g) return;
+        if (!ici) return;
         construireInterface();
     }
     const {racine, choix, etiquette} = TRI.ui;
-    if (!racine.isConnected || (g && racine.closest("#v-coll") === null)) {
+    if (ici) {
         const repere = $("#v-coll #selBtn");
         const outils = $("#v-coll #cTools");
-        if (repere) repere.after(racine);
-        else if (outils) outils.append(racine);
-        else if (!g) return;
+        const malPlacee = !racine.isConnected || (repere ? racine.previousElementSibling !== repere : !!outils && racine.parentNode !== outils);
+        if (malPlacee) {
+            if (repere) repere.after(racine);
+            else if (outils) outils.append(racine);
+        }
     }
-    racine.hidden = !g;
+    const cache = !ici || !racine.isConnected;
+    if (racine.hidden !== cache) racine.hidden = cache;
     if (choix.value !== mode) choix.value = mode;
-    etiquette.hidden = false;
+    if (etiquette.hidden) etiquette.hidden = false;
     racine.classList.toggle("wpx-tri-actif", mode !== "site");
 }
 
@@ -1126,6 +2161,25 @@ function statut(texte) {
    ========================================================================== */
 function demarrer() {
     installerStyles();
+    /* (2.0) la base : son état (pour y noter les dates lues), les cadenas captés au passage, une construction à reprendre */
+    try {
+        installerRelaisCadenas();
+        lireEtatBase().catch(() => {});
+        /* (2.1) le bouton de la base dans l'en-tête, reposé si le site redessine sa rangée */
+        installerBoutonBase();
+        setInterval(installerBoutonBase, 2000);
+        /* (2.5) le tri et « Mes dernières cartes », reposés à côté de « Sélectionner » */
+        setInterval(majInterface, 1000);
+        reprendreConstruction();
+        /* un autre outil (le verrouillage) demande une base à jour : on la met à jour, puis on le prévient */
+        D.addEventListener("wpx-base-demande-maj", () => {
+            avecBase(() => majBaseDifferences(texte => majPanneauBase(texte), () => true))
+                .catch(erreur => console.warn("[base] mise à jour demandée impossible :", erreur))
+                .finally(() => D.dispatchEvent(new CustomEvent("wpx-base-a-jour")));
+        });
+    } catch (erreur) {
+        console.warn("[tri par date] base de la collection indisponible :", erreur);
+    }
     new MutationObserver(changements => {
         for (const c of changements) {
             const cible = c.target.nodeType === 1 ? c.target : c.target.parentElement;
@@ -1137,7 +2191,8 @@ function demarrer() {
         }
     }).observe(D.body, {childList: true, subtree: true, attributes: true, attributeFilter: ["class"]});
     D.addEventListener("keydown", e => {
-        if (e.key === "Escape" && DER.vue && !DER.vue.hidden && !ficheOuverte() && !$(".veil.on")) fermerDernieres();
+        if (e.key === "Escape" && TB.vue && !TB.vue.hidden) fermerTableauBord();
+        else if (e.key === "Escape" && DER.vue && !DER.vue.hidden && !ficheOuverte() && !$(".veil.on")) fermerDernieres();
     });
     planifier();
     setTimeout(() => {

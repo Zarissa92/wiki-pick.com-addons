@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         [test]Wiki-Pick verrouillage (tiroir d'export)
 // @namespace    local.wikipick.lock
-// @version      2.19
-// @description  Verrouille ou déverrouille les cartes d'étiquettes depuis le tiroir d'export d'Album+cleaner (à côté de Clean et Largeur)
+// @version      3.6
+// @description  Verrouille ou déverrouille les cartes d'étiquettes depuis le tiroir d'export d'Album+cleaner (bouton Verrouiller à côté d'Exporter) : dans ta collection, exactement les exemplaires qui portent l'étiquette, lus dans la base de la collection de l'addon de tri quand elle existe
 // @match        https://wiki-pick.com/*
 // @grant        none
 // @run-at       document-idle
@@ -16,7 +16,8 @@
   const DELAI_ENTRE_VERROUILLAGES_MS = 900;
   const CONFIRMATION_A_PARTIR_DE = 10;
   const TAILLE_LOT = 50;
-  const LECTURES_SIMULTANEES = 25;
+  const LECTURES_SIMULTANEES = 4;          // (3.0) 4 fiches à la fois, comme les autres outils (25 avant)
+  const PAUSE_ENTRE_PAGES_MS = 400;        // (3.0) entre deux pages de la collection lues pour une étiquette
   const PAUSE_ENTRE_LOTS_MS = 2000;
   const REESSAIS_429 = 5;
   const ATTENTE_429_MS = 5000;
@@ -24,8 +25,7 @@
   const URL_SITE = "https://wiki-pick.com";
   const LIGNES_AFFICHEES_MAX = 300;
   const LIGNES_GARDEES_MAX = 20000;
-  const PREFIXES_CACHE_OUTIL = ["wpx.aDeja.", "wpx.chances.comptes", "wpx.discord.achats"];
-  const CACHES_VIDES_EN_QUITTANT = ["wpx.aDeja.", "wpx.chances.comptes"];
+  // (3.0) plus aucune clé du script principal n'est effacée ici : ses caches (aDeja, chances, achats Discord) sont à lui
   // ===== FIN DES PARAMÈTRES =====
 
   if (window.__wpxVerrouActif) return;
@@ -36,8 +36,8 @@
   const LOG = [];
   const JRN = { vue: null, corps: null, compte: null };
   const ETAT = { panneau: null, journal: null, resume: null, corps: null, signature: "", planifie: 0,
-                 statut: null, compte: null, fill: null, detail: null, apres: null, bouton: null, groupes: [],
-                 dedans: false, aVider: false };
+                 statut: null, compte: null, fill: null, detail: null, apres: null, groupes: [],
+                 dedans: false };
 
   const SVG_FERME = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
   const SVG_OUVERT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.7-1.5"/></svg>';
@@ -72,6 +72,24 @@
     return e;
   }
 
+  // le pseudo du joueur connecté, comme le script principal
+  const pseudoJoueur = () => ["#meBtn > span:not(.av):last-of-type", "#menuName", "#tiroirNom"]
+    .map(choix => propre(($(choix) || {}).textContent)).find(nom => nom && nom !== "—" && nom !== "Wiki-Pick") || "";
+
+  // (3.0) les étiquettes affichées sont-elles les tiennes ? (Ma collection, ou ton propre profil)
+  function contextePropre() {
+    const vue = $("main section.view.on");
+    if (!vue) return false;
+    if (vue.id === "v-coll") return true;
+    if (vue.id === "v-profile") {
+      const av = $("#profile .avwrap .av");
+      const nom = propre(av && av.dataset.n);
+      const moi = pseudoJoueur();
+      return !!nom && !!moi && nom.toLowerCase() === moi.toLowerCase();
+    }
+    return false;
+  }
+
   // ---------- Lecture de la sélection dans le tiroir ----------
   const EXCLUS_TITRE = "small, .albpastille, .albfleches, .pdico, button";
   function nomDuTitre(titre) {
@@ -85,17 +103,20 @@
     return propre(texte);
   }
 
+  // (3.0) chaque nom garde toutes ses sections : deux étiquettes au même nom ne se confondent plus
   function sectionsParNom() {
     const map = new Map();
     for (const s of $$("section.album")) {
       const t = $("h2.albtitre", s);
       if (!t) continue;
       const nom = nomDuTitre(t);
-      if (!map.has(nom)) map.set(nom, s);
+      if (!map.has(nom)) map.set(nom, []);
+      map.get(nom).push(s);
     }
     return map;
   }
 
+  // Ailleurs que chez toi : les cartes affichées de l'étiquette (tes exemplaires de ces cartes, lus sur leurs fiches)
   function cartesDeSection(section) {
     const vues = new Set();
     const liste = [];
@@ -115,14 +136,14 @@
     const lignes = $$('.wpx-t-ligne[aria-selected="true"]', tiroir);
     if (!lignes.length) return [];
     const sections = sectionsParNom();
+    const rang = new Map();                               // la n-ième ligne d'un nom va à la n-ième section de ce nom
     return lignes.map(l => {
       const nom = propre(($(":scope > span", l) || {}).textContent);
-      return { nom, section: sections.get(nom) || null };
+      const i = rang.get(nom) || 0;
+      rang.set(nom, i + 1);
+      const liste = sections.get(nom) || [];
+      return { nom, section: liste[Math.min(i, liste.length - 1)] || null, rang: i };
     });
-  }
-
-  function groupesChoisis() {
-    return etiquettesChoisies().map(e => ({ nom: e.nom, cartes: e.section ? cartesDeSection(e.section) : null }));
   }
 
   function fusionner(groupes) {
@@ -136,12 +157,14 @@
     return liste;
   }
 
-  function cartesChoisies() {
-    return fusionner(groupesChoisis());
-  }
-
+  // (3.2) chez toi, la liste vient de la collection : seules comptent les lignes cochées du tiroir (rien à parcourir
+  // dans la page) ; ailleurs, les cartes affichées de chaque étiquette cochée
   function signatureSelection() {
-    return etiquettesChoisies()
+    const tiroir = $("#wpx-tiroir");
+    const cochees = tiroir ? $$('.wpx-t-ligne[aria-selected="true"] > span', tiroir).map(s => propre(s.textContent)) : [];
+    if (contextePropre()) return "moi|" + cochees.join("|");
+    if (!cochees.length) return "autre|";
+    return "autre|" + etiquettesChoisies()
       .map(e => e.nom + ":" + (e.section ? e.section.querySelectorAll(".card[data-cle]").length : "x"))
       .join("|");
   }
@@ -186,7 +209,7 @@
   async function exemplairesDe(cid) {
     const res = await fetchPatient(URL_SITE + "/api/card?cid=" + encodeURIComponent(cid), { credentials: "include" }, "la lecture de " + cid);
     if (!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
+    const data = JSON.parse(await res.text());       // (3.4) décodé ici : voir lireCollection
     const mine = data.mine ?? (data.card && data.card.mine) ?? [];
     return mine.filter(m => Number.isInteger(m.id));
   }
@@ -233,6 +256,201 @@
     await Promise.all(Array.from({ length: Math.min(LECTURES_SIMULTANEES, cids.length) }, travailleur));
   }
 
+  // ---------- (3.0) Les exemplaires d'une étiquette, lus dans ta collection ----------
+  // La collection (/api/collection/page) se filtre par étiquette (tag=<id>) et donne, pour chaque exemplaire, son
+  // identifiant, ses étiquettes et son cadenas : on sait exactement quels exemplaires portent l'étiquette, y compris
+  // ceux que la page n'a pas encore affichés, sans lire une seule fiche.
+  const TAGS = { liste: null, parCle: new Map(), file: Promise.resolve(), enCours: new Set() };
+
+  async function lireCollection(tag, page) {
+    const res = await fetchPatient(URL_SITE + "/api/collection/page?" + new URLSearchParams({ vue: "cartes", q: "", rar: "", tag, excl: "1", page }),
+      { credentials: "include", headers: { Accept: "application/json" } }, "la lecture de ta collection");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    // (3.4) le texte, décodé ici : sous Firefox, les objets de .json() appartiennent à la page et ne peuvent pas être
+    // rangés dans ceux du script (« XrayWrapper »)
+    return JSON.parse(await res.text());
+  }
+
+  const estListeEtiquettes = v => Array.isArray(v) && v.length > 0 && v.every(t => t && t.id != null && typeof t.name === "string");
+
+  // ---------- (3.3) La base de la collection, tenue par l'addon de tri par date ----------
+  // Quand elle existe, les exemplaires d'une étiquette y sont lus directement (aucune requête au site). Si elle a plus de
+  // 10 minutes, l'addon la met d'abord à jour (quelques requêtes). Sans base (ou sans l'addon), on lit le site, comme avant.
+  const BASE_FRAICHE_MS = 10 * 60000;
+  const BASEL = { db: null, absente: false };
+
+  // ouvre la base sans jamais la créer : si elle n'existe pas, l'ouverture est annulée
+  function ouvrirBase() {
+    if (BASEL.db) return Promise.resolve(BASEL.db);
+    if (BASEL.absente || !window.indexedDB) return Promise.resolve(null);
+    return new Promise(ok => {
+      const req = indexedDB.open("wpx-collection");
+      req.onupgradeneeded = () => { BASEL.absente = true; req.transaction.abort(); };
+      req.onsuccess = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains("ex") || !db.objectStoreNames.contains("meta")) { db.close(); BASEL.absente = true; return ok(null); }
+        db.onversionchange = () => { db.close(); BASEL.db = null; };
+        ok(BASEL.db = db);
+      };
+      req.onerror = () => ok(null);
+    });
+  }
+  // (3.5) sous Firefox, ce que la base renvoie appartient à la page : recopié côté script avant d'être utilisé ou modifié
+  const cloner = v => (v && typeof v === "object" ? JSON.parse(JSON.stringify(v)) : v);
+  const attendreReq = req => new Promise((ok, ko) => { req.onsuccess = () => ok(cloner(req.result)); req.onerror = () => ko(req.error); });
+
+  async function etatBase() {
+    const db = await ouvrirBase();
+    if (!db) return null;
+    const etat = await attendreReq(db.transaction("meta").objectStore("meta").get("etat"));
+    return etat && etat.init && etat.init.fini ? etat : null;
+  }
+
+  // demande à l'addon une base à jour, et attend qu'il ait fini (60 s au plus)
+  function demanderMiseAJour() {
+    return new Promise(ok => {
+      const fin = () => { clearTimeout(minuterie); document.removeEventListener("wpx-base-a-jour", fin); ok(); };
+      const minuterie = setTimeout(fin, 60000);
+      document.addEventListener("wpx-base-a-jour", fin);
+      document.dispatchEvent(new CustomEvent("wpx-base-demande-maj"));
+    });
+  }
+
+  // la base, à jour ; null si elle n'existe pas ou n'a pas pu être mise à jour
+  let baseVerifiee = 0;
+  async function baseAJour() {
+    let etat = await etatBase();
+    if (!etat) return null;
+    if (Date.now() - (etat.maj || 0) > BASE_FRAICHE_MS && Date.now() - baseVerifiee > 30000) {
+      if (ETAT.detail) ETAT.detail.textContent = "Mise à jour de la base de ta collection…";
+      journal("Base de la collection : mise à jour demandée à l'addon de tri.");
+      await demanderMiseAJour();
+      baseVerifiee = Date.now();
+      etat = await etatBase();
+    }
+    return etat && Date.now() - (etat.maj || 0) <= BASE_FRAICHE_MS ? etat : null;
+  }
+
+  async function exemplairesEtiquetteDansBase(tagId) {
+    const db = await ouvrirBase();
+    const liste = await attendreReq(db.transaction("ex").objectStore("ex").index("tags").getAll(IDBKeyRange.only(Number(tagId))));
+    return liste.map(r => ({ nom: r.n || r.cid, cle: "ex:" + r.id, id: r.id, locked: !!r.locked, tag: true }));
+  }
+
+  // les cadenas posés ou retirés sont notés dans la base (l'addon le fait aussi s'il les voit passer)
+  async function noterCadenas(ids, on) {
+    const db = await ouvrirBase();
+    if (!db || !ids.length) return;
+    const tx = db.transaction("ex", "readwrite");
+    const s = tx.objectStore("ex");
+    for (const id of ids) {
+      const lecture = s.get(id);
+      lecture.onsuccess = () => { if (lecture.result) { const e = cloner(lecture.result); e.locked = on; s.put(e); } };
+    }
+  }
+
+  // la liste de tes étiquettes (identifiant, nom) : celle de la base, sinon celle du site, sinon celle d'une page de la collection
+  async function listeEtiquettes() {
+    if (TAGS.liste) return TAGS.liste;
+    try {
+      const etat = await etatBase();
+      if (etat && estListeEtiquettes(etat.tags)) return (TAGS.liste = etat.tags);
+    } catch (e) { /* pas de base : on demande au site */ }
+    try {
+      const res = await fetchPatient(URL_SITE + "/api/collection/etiquettes", { credentials: "include", headers: { Accept: "application/json" } }, "tes étiquettes");
+      if (res.ok) {
+        const d = JSON.parse(await res.text());
+        const liste = [d, d && d.tags, d && d.etiquettes].find(estListeEtiquettes);
+        if (liste) return (TAGS.liste = liste);
+      }
+    } catch (e) { /* on passe par la collection */ }
+    const d = await lireCollection("", 0);
+    if (!estListeEtiquettes(d && d.tags)) throw new Error("liste des étiquettes introuvable");
+    return (TAGS.liste = d.tags);
+  }
+
+  // l'identifiant d'une étiquette : celui de sa section (data-albid) s'il existe, sinon son nom, s'il est unique
+  async function idEtiquette(e) {
+    const liste = await listeEtiquettes();
+    const albid = e.section && e.section.dataset.albid;
+    if (albid && liste.some(t => String(t.id) === String(albid))) return String(albid);
+    const memeNom = liste.filter(t => propre(t.name) === e.nom);
+    if (memeNom.length === 1) return String(memeNom[0].id);
+    if (memeNom.length > 1 && memeNom[e.rang]) return String(memeNom[e.rang].id);
+    return null;
+  }
+
+  async function exemplairesEtiquette(tagId) {
+    try {
+      if (await baseAJour()) return await exemplairesEtiquetteDansBase(tagId);
+    } catch (e) {
+      journal("Base de la collection illisible (" + e.message + ") : lecture sur le site.");
+    }
+    const cartes = [];
+    let page = 0, pages = 1;
+    while (page < pages) {
+      const d = await lireCollection(tagId, page);
+      if (!d || !Array.isArray(d.lignes)) throw new Error("réponse inattendue du site");
+      if (estListeEtiquettes(d.tags)) TAGS.liste = d.tags;
+      pages = d.pages || 1;
+      for (const l of d.lignes) {
+        if (!Array.isArray(l) || !Array.isArray(l[9])) continue;
+        // par sécurité : seulement les exemplaires qui portent vraiment cette étiquette
+        if (Array.isArray(l[10]) && !l[10].map(String).includes(String(tagId))) continue;
+        for (const id of l[9]) {
+          if (!Number.isInteger(id)) continue;
+          cartes.push({ nom: propre(l[1] || l[0]), cle: "ex:" + id, id, locked: !!l[8], tag: true });
+        }
+      }
+      page++;
+      if (page < pages) await pause(PAUSE_ENTRE_PAGES_MS);
+    }
+    return cartes;
+  }
+
+  const cleTag = e => e.nom + "#" + e.rang;
+
+  // une étiquette à la fois (pas de rafale), puis le panneau se redessine
+  function chargerEtiquette(e) {
+    const cle = cleTag(e);
+    if (TAGS.parCle.has(cle) || TAGS.enCours.has(cle)) return;
+    TAGS.enCours.add(cle);
+    TAGS.file = TAGS.file.then(async () => {
+      let resultat;
+      try {
+        const id = await idEtiquette(e);
+        if (!id) resultat = { cartes: null, erreur: "étiquette introuvable dans ta collection" };
+        else resultat = { cartes: await exemplairesEtiquette(id), id };
+      } catch (erreur) {
+        resultat = { cartes: null, erreur: "lecture impossible (" + erreur.message + ")" };
+        journal("Étiquette « " + e.nom + " » : " + resultat.erreur);
+      }
+      TAGS.enCours.delete(cle);
+      TAGS.parCle.set(cle, Object.assign(resultat, { t: Date.now() }));
+      if (ETAT.dedans) rafraichirPanneau();
+    });
+  }
+
+  function oublierEtiquettes() {
+    TAGS.parCle.clear();
+    TAGS.enCours.clear();
+    TAGS.liste = null;
+  }
+
+  // les groupes à afficher : chez toi, les exemplaires lus par étiquette ; ailleurs, les cartes affichées
+  function groupesChoisis() {
+    const moi = contextePropre();
+    return etiquettesChoisies().map(e => {
+      if (!moi) return { nom: e.nom, cartes: e.section ? cartesDeSection(e.section) : null, mode: "fiche" };
+      let lu = TAGS.parCle.get(cleTag(e));
+      // (3.2) une étiquette lue il y a plus de 5 minutes (tu as pu changer ses cartes entre-temps) est relue
+      if (lu && !RUN.en && Date.now() - (lu.t || 0) > 5 * 60000) { TAGS.parCle.delete(cleTag(e)); lu = null; }
+      if (lu) return { nom: e.nom, cartes: lu.cartes, erreur: lu.erreur, mode: "tag" };
+      chargerEtiquette(e);
+      return { nom: e.nom, cartes: null, charge: true, mode: "tag" };
+    });
+  }
+
   // ---------- Journal ----------
   const heure = d => p2(d.getHours()) + ":" + p2(d.getMinutes()) + ":" + p2(d.getSeconds());
   const texteJournal = () => LOG.map(l => `[${heure(l.t)}] ${l.msg}`).join("\n");
@@ -263,6 +481,7 @@
       JRN.corps.scrollTop = JRN.corps.scrollHeight;
     }
     majCompteJournal();
+    sauverSession();
   }
 
   function majCompteJournal() {
@@ -280,7 +499,7 @@
         h("button", { type: "button", class: "wpx-btn", title: "Télécharger le journal en .txt", onclick: exporterJournal }, "Exporter .txt"),
         h("button", { type: "button", class: "wpx-btn", title: "Copier le journal", onclick: copierJournal }, "Copier"),
         h("button", { type: "button", class: "wpx-btn", title: "Effacer le journal", onclick: viderJournal }, "Vider"),
-        h("button", { type: "button", class: "wpx-btn", title: "Effacer le journal et le cache de l'outil", onclick: viderMemoire }, "Vider la mémoire"),
+        h("button", { type: "button", class: "wpx-btn", title: "Effacer le journal et les étiquettes déjà lues", onclick: viderMemoire }, "Vider la mémoire"),
         h("button", { type: "button", class: "wpx-btn", title: "Fermer le journal", "aria-label": "Fermer le journal", onclick: fermerJournal }, "✕")),
       JRN.corps);
     document.body.append(JRN.vue);
@@ -346,65 +565,69 @@
     if (JRN.vue) remplirJournal();
   }
 
-  function cachesOutil(prefixes) {
-    const cles = [];
-    try {
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (prefixes.some(p => k.startsWith(p))) cles.push(k);
-      }
-    } catch (e) { /* stockage indisponible */ }
-    return cles;
-  }
-
+  // (3.0) le journal et les étiquettes déjà lues (relues à la prochaine sélection) ; rien d'autre
   function viderMemoire() {
     if (RUN.en) return toast("Attends la fin du traitement pour vider la mémoire.");
-    const cles = cachesOutil(PREFIXES_CACHE_OUTIL);
-    let octets = 0;
-    for (const k of cles) {
-      try { octets += (localStorage.getItem(k) || "").length; } catch (e) { /* compté comme rien */ }
-    }
-    const ko = Math.max(1, Math.round(octets / 1024));
     if (!confirm(
       "Vider la mémoire ?\n\n" +
       `• Journal : ${nombre(LOG.length)} ligne(s) effacée(s). Exporte-le avant si tu veux le garder.\n` +
-      `• Cache de l'outil : ${nombre(cles.length)} entrée(s), environ ${nombre(ko)} Ko\n\n` +
-      "Ne sont pas touchés : tes réglages, tes derniers paquets, tes serveurs Discord, la file d'envoi.")) return;
+      `• Étiquettes déjà lues : ${nombre(TAGS.parCle.size)}, relues à la prochaine sélection.\n\n` +
+      "Rien d'autre n'est touché (réglages et caches du script principal compris).")) return;
     LOG.length = 0;
     if (ETAT.journal) ETAT.journal.textContent = "";
     if (JRN.vue) remplirJournal();
-    let retirees = 0;
-    for (const k of cles) {
-      try { localStorage.removeItem(k); retirees++; } catch (e) { /* suivante */ }
-    }
+    oublierEtiquettes();
     majCompteJournal();
-    toast(`Mémoire vidée : journal effacé, ${nombre(retirees)} entrée(s) de cache retirée(s).`);
+    rafraichirPanneau();
+    toast("Mémoire vidée : journal effacé, étiquettes à relire.");
   }
 
-  // En quittant le panneau : journal et caches vidés. Pas de rechargement de la page.
-  function viderEnQuittant() {
-    if (RUN.en) { ETAT.aVider = true; return; }
-    ETAT.aVider = false;
-    LOG.length = 0;
-    DERNIER.cartes = null;
-    DERNIER.on = null;
+  // (3.2) En quittant le panneau (ou la page d'étiquettes), rien n'est effacé : le journal, le dernier traitement et
+  // les étiquettes déjà lues restent. Ce qui faisait ramer, c'était le travail fait à chaque changement de la page ;
+  // panneau fermé, l'outil ne fait plus rien d'autre que reposer son bouton. Un traitement en cours continue.
+  function quitterPanneau() {
     ETAT.groupes = [];
     ETAT.signature = "";
-    if (ETAT.corps) ETAT.corps.replaceChildren();
-    if (ETAT.journal) ETAT.journal.textContent = "";
-    if (ETAT.resume) ETAT.resume.textContent = "";
-    rafraichirApres();
-    setProgres({});
-    if (JRN.vue) {
-      JRN.vue.hidden = true;
-      JRN.corps.textContent = "";
-    }
-    majBoutonsJournal();
-    majCompteJournal();
-    try {
-      for (const k of cachesOutil(CACHES_VIDES_EN_QUITTANT)) localStorage.removeItem(k);
-    } catch (e) { /* rien à retirer */ }
+    if (ETAT.corps) ETAT.corps.replaceChildren();       // la liste (parfois des milliers de lignes) est refaite au retour
   }
+
+  // ---------- (3.2) La session : le journal et le dernier traitement survivent à un rechargement de l'onglet ----------
+  const CLE_SESSION = "wpx.vr.session";
+  const LIGNES_SESSION_MAX = 2000;
+  let sauvegardePrevue = 0;
+
+  function sauverSession() {
+    if (sauvegardePrevue) return;
+    sauvegardePrevue = setTimeout(() => {
+      sauvegardePrevue = 0;
+      try {
+        sessionStorage.setItem(CLE_SESSION, JSON.stringify({
+          log: LOG.slice(-LIGNES_SESSION_MAX).map(l => [l.t.getTime(), l.msg]),
+          dernier: DERNIER.cartes ? { on: DERNIER.on, cartes: DERNIER.cartes } : null
+        }));
+      } catch (e) { /* stockage plein ou indisponible : la session vaut pour cette page seulement */ }
+    }, 1000);
+  }
+
+  function restaurerSession() {
+    try {
+      const s = JSON.parse(sessionStorage.getItem(CLE_SESSION) || "null");
+      if (!s) return;
+      if (Array.isArray(s.log)) for (const [t, msg] of s.log) LOG.push({ t: new Date(t), msg: String(msg) });
+      if (s.dernier && Array.isArray(s.dernier.cartes) && s.dernier.cartes.length) {
+        DERNIER.cartes = s.dernier.cartes;
+        DERNIER.on = !!s.dernier.on;
+      }
+    } catch (e) { /* session illisible : on repart de zéro */ }
+  }
+
+  // un traitement en cours ne survit pas à un rechargement : le navigateur demande d'abord confirmation
+  addEventListener("beforeunload", e => {
+    if (!RUN.en) return;
+    journal("Page quittée pendant un traitement : il s'arrête ici.");
+    e.preventDefault();
+    e.returnValue = "";
+  });
 
   // ---------- Progression ----------
   function setProgres({ fait = 0, total = 0, statut = "Prêt", etat = "", detail = "" }) {
@@ -448,15 +671,30 @@
         const libelleLot = `Lot ${li + 1}/${lots.length}`;
         journal(`--- ${libelleLot} : ${pluriel(lot.length, "carte")} ---`);
 
+        // (3.0) seules les cartes vues ailleurs que chez toi ont besoin de leur fiche : les exemplaires d'une
+        // étiquette sont déjà connus, avec leur cadenas
         const copies = new Map();
-        await lireLot(lot, copies, (lus, nb) => {
-          setProgres({ fait, total, statut: "En cours", etat: "en", detail: `${libelleLot} · lecture des copies ${lus} / ${nb}` });
-        });
+        const aLire = lot.filter(c => !c.tag);
+        if (aLire.length) {
+          await lireLot(aLire, copies, (lus, nb) => {
+            setProgres({ fait, total, statut: "En cours", etat: "en", detail: `${libelleLot} · lecture des copies ${lus} / ${nb}` });
+          });
+        }
 
         const aEnvoyer = [];
         for (const c of lot) {
           if (RUN.stop) break;
           const etiquette = c.sh ? " (chromatique)" : c.hw ? " (Halloween)" : "";
+          if (c.tag) {
+            if (c.locked === on) {
+              cartesDeja++;
+              journal(`Déjà ${on ? "verrouillée" : "déverrouillée"} : ${c.nom}  (id ${c.id})`);
+              fait++;
+            } else {
+              aEnvoyer.push({ c, etiquette: "", ids: [c.id] });
+            }
+            continue;
+          }
           try {
             const lecture = copies.get(c.cid);
             if (!lecture || lecture.erreur) throw (lecture && lecture.erreur) || new Error("lecture impossible");
@@ -490,26 +728,28 @@
             detail: `${libelleLot} · envoi : ${pluriel(groupe.length, "carte")}, ${pluriel(ids.length, "exemplaire")}` });
           let traite = false;
           if (GROUPE.possible && ids.length > 1) {
-            let reussi = false;
             try {
               const statut = await setVerrouGroupe(ids, on);
-              reussi = statut >= 200 && statut < 300;
               journal(`${statut}  envoi groupé de ${pluriel(ids.length, "exemplaire")} (${pluriel(groupe.length, "carte")})`);
-              if (reussi) {
-                for (const x of groupe) journal(`   ${on ? "verrouillée" : "déverrouillée"} : ${x.c.nom}${x.etiquette}  (id ${x.ids.join(", ")})`);
+              if (statut >= 200 && statut < 300) {
+                traite = true;
+                for (const x of groupe) {
+                  journal(`   ${on ? "verrouillée" : "déverrouillée"} : ${x.c.nom}${x.etiquette}  (id ${x.ids.join(", ")})`);
+                  if (x.c.tag) x.c.locked = on;
+                }
                 cartesModifiees += groupe.length;
                 exemplaires += ids.length;
+                fait += groupe.length;
+                noterCadenas(ids, on).catch(() => {});
               } else if (!GROUPE.possible) {
                 journal("Le site ne connaît pas l'envoi groupé : retour au verrouillage carte par carte.");
               } else {
-                erreurs++;
+                // (3.0) un refus de l'envoi groupé n'est plus compté comme fait : on reprend carte par carte
+                journal(`Envoi groupé refusé (${statut}) : nouvel essai carte par carte.`);
               }
             } catch (e) {
-              erreurs++;
-              journal("Erreur sur l'envoi groupé : " + e.message);
+              journal("Erreur sur l'envoi groupé : " + e.message + " : nouvel essai carte par carte.");
             }
-            traite = reussi || GROUPE.possible;
-            if (traite) fait += groupe.length;
           }
           if (!traite) {
             for (const x of groupe) {
@@ -519,7 +759,7 @@
                 if (RUN.stop) break;
                 try {
                   const statut = await setVerrou(id, on);
-                  if (statut >= 200 && statut < 300) { modifiees++; exemplaires++; }
+                  if (statut >= 200 && statut < 300) { modifiees++; exemplaires++; noterCadenas([id], on).catch(() => {}); }
                   else erreurs++;
                   journal(`${statut}  ${x.c.nom}${x.etiquette}  (id ${id})`);
                 } catch (e) {
@@ -527,7 +767,10 @@
                   journal("Erreur  " + x.c.nom + " : " + e.message);
                 }
               }
-              if (modifiees) cartesModifiees++;
+              if (modifiees) {
+                cartesModifiees++;
+                if (x.c.tag) x.c.locked = on;
+              }
               fait++;
               setProgres({ fait, total, statut: "En cours", etat: "en", detail: `${libelleLot} · dernière carte traitée : ${x.c.nom}` });
             }
@@ -563,8 +806,9 @@
       journal("Terminé : " + statut.toLowerCase() + ".");
       DERNIER.cartes = cartes;
       DERNIER.on = on;
+      sauverSession();
       majEtatTraitement();
-      if (ETAT.aVider && !ETAT.dedans) viderEnQuittant();
+      if (ETAT.panneau && ETAT.dedans) rafraichirPanneau();          // les cadenas de la liste suivent (panneau ouvert)
     }
   }
 
@@ -578,7 +822,9 @@
   }
 
   function lancerSelection(on) {
-    lancer(cartesChoisies(), on);
+    const groupes = groupesChoisis();
+    if (groupes.some(g => g.charge)) return toast("Les étiquettes sont encore en lecture : attends qu'elles s'affichent dans la liste.");
+    lancer(fusionner(groupes), on);
   }
 
   // ---------- Panneau dans le tiroir ----------
@@ -588,16 +834,24 @@
     p.classList.toggle("wpx-vr-en", RUN.en);
     const groupes = groupesChoisis();
     const tous = fusionner(groupes);
+    const moi = groupes.some(g => g.mode === "tag");
     ETAT.groupes = groupes;
     ETAT.signature = signatureSelection();
-    ETAT.resume.textContent = pluriel(groupes.length, "étiquette") + " · " + pluriel(tous.length, "carte") + " à traiter";
+    const enLecture = groupes.filter(g => g.charge).length;
+    ETAT.resume.textContent = pluriel(groupes.length, "étiquette") + " · " + pluriel(tous.length, moi ? "exemplaire" : "carte") + " à traiter"
+      + (enLecture ? " · " + enLecture + " en lecture…" : "");
 
     const frag = document.createDocumentFragment();
     if (!groupes.length) frag.append(h("p", { class: "wpx-vr-vide" }, "Coche des étiquettes dans la liste ci-dessus : leurs cartes apparaissent ici."));
     groupes.forEach((g, gi) => {
       const bloc = h("div", { class: "wpx-vr-cat" });
-      const tete = h("div", { class: "wpx-vr-cat-tete" }, h("span", { class: "wpx-vr-nom", title: g.nom }, g.nom),
-        h("small", null, g.cartes ? pluriel(g.cartes.length, "carte") : "cartes non chargées"));
+      const verrouillees = g.cartes && g.mode === "tag" ? g.cartes.filter(c => c.locked).length : 0;
+      const detail = g.charge ? "lecture de ta collection…"
+        : g.erreur ? g.erreur
+        : !g.cartes ? "cartes non chargées"
+        : g.mode === "tag" ? pluriel(g.cartes.length, "exemplaire") + " · " + nombre(verrouillees) + " verrouillé(s)"
+        : pluriel(g.cartes.length, "carte");
+      const tete = h("div", { class: "wpx-vr-cat-tete" }, h("span", { class: "wpx-vr-nom", title: g.nom }, g.nom), h("small", null, detail));
       if (g.cartes && g.cartes.length) {
         tete.append(
           h("button", { type: "button", class: "wpx-btn wpx-vr-act", title: "Verrouiller toutes les cartes de cette étiquette", "data-act": "on", "data-g": gi }, SVG_FERME, "Tout verrouiller"),
@@ -605,9 +859,9 @@
       }
       bloc.append(tete);
       (g.cartes || []).forEach((c, ci) => {
-        const suffixe = c.sh ? "chromatique" : c.hw ? "Halloween" : "";
-        bloc.append(h("div", { class: "wpx-vr-ligne" },
-          h("span", { title: c.nom }, c.nom),
+        const suffixe = c.tag ? (c.locked ? "verrouillée" : "") : c.sh ? "chromatique" : c.hw ? "Halloween" : "";
+        bloc.append(h("div", { class: "wpx-vr-ligne" + (c.tag && c.locked ? " wpx-vr-fermee" : "") },
+          h("span", { title: c.tag ? c.nom + " · exemplaire " + c.id : c.nom }, c.nom),
           suffixe ? h("small", null, suffixe) : null,
           h("button", { type: "button", class: "wpx-vr-ico wpx-vr-act", title: "Verrouiller cette carte", "aria-label": "Verrouiller " + c.nom, "data-act": "on", "data-g": gi, "data-i": ci }, SVG_FERME),
           h("button", { type: "button", class: "wpx-vr-ico wpx-vr-act", title: "Déverrouiller cette carte", "aria-label": "Déverrouiller " + c.nom, "data-act": "off", "data-g": gi, "data-i": ci }, SVG_OUVERT)));
@@ -671,7 +925,7 @@
     ETAT.apres = h("div", { class: "wpx-vr-apres", hidden: true });
     const stop = h("button", { type: "button", class: "wpx-btn wpx-vr-stop", onclick: () => { RUN.stop = true; journal("Arrêt demandé après la carte en cours…"); ETAT.detail.textContent = "Arrêt demandé, après la carte en cours…"; } }, "Arrêter");
     const bJournal = h("button", { type: "button", class: "wpx-btn wpx-vr-jbtn", "aria-pressed": "false", title: "Afficher ou masquer le journal", onclick: basculerJournal }, "Journal");
-    const bMemoire = h("button", { type: "button", class: "wpx-btn", title: "Effacer le journal et le cache de l'outil", onclick: viderMemoire }, "Vider la mémoire");
+    const bMemoire = h("button", { type: "button", class: "wpx-btn", title: "Effacer le journal et les étiquettes déjà lues", onclick: viderMemoire }, "Vider la mémoire");
 
     ETAT.panneau = h("section", { class: "wpx-vr-panel" },
       h("div", { class: "wpx-vr-tete" }, ETAT.resume,
@@ -702,7 +956,7 @@
     if (!t) return;
     if (on && !t.querySelector(".wpx-vr-panel")) installerDansTiroir(t);
     t.classList.toggle("wpx-vr-on", on);
-    if (ETAT.bouton) ETAT.bouton.setAttribute("aria-pressed", String(on));
+    majBoutons(on);
     const seg = $(".wpx-seg", t);
     if (seg) {
       const garder = on ? null : modeAlbum();
@@ -723,25 +977,29 @@
       }
       return;
     }
-    const exp = $$(".wpx-exports button").find(b => b.getClientRects().length);
-    if (!exp) return toast("Va sur une page d'étiquettes (un profil, ou Ma collection > Étiquettes) : le verrouillage part des étiquettes affichées.");
+    const exp = $$(".wpx-exports > button:not(.wpx-vr-btn)").find(b => b.getClientRects().length);
+    if (!exp) return toast("Va sur une page d'étiquettes (Ma collection > Étiquettes, ou ton profil) : le verrouillage part des étiquettes affichées.");
     exp.click();
     t = $("#wpx-tiroir");
     if (t) basculerMode(true);
   }
 
+  // (3.1) le bouton est dans la barre des étiquettes, entre le trait et « Exporter » (une barre sur un profil, une
+  // dans Ma collection) ; il n'est plus dans l'en-tête, à côté de Clean et Largeur
   function installerBouton() {
-    if (ETAT.bouton && ETAT.bouton.isConnected) return;
-    const rangee = $("body > header.top .row1");
-    if (!rangee) return;
-    const existant = rangee.querySelector(".wpx-vr-crane");
-    if (existant) existant.remove();
-    const repere = rangee.querySelector(":scope > [data-wpx-reglages]") || rangee.querySelector(":scope > [data-wpx-bascule]");
-    const bouton = h("button", { type: "button", class: "wpx-crane wpx-vr-crane", "aria-pressed": "false",
-      title: "Verrouiller ou déverrouiller les cartes des étiquettes affichées", "aria-label": "Verrouiller les cartes", onclick: ouvrirVerrou }, SVG_FERME);
-    if (repere) repere.after(bouton);
-    else rangee.append(bouton);
-    ETAT.bouton = bouton;
+    $$("body > header.top .row1 > .wpx-vr-crane").forEach(b => b.remove());
+    for (const zone of $$(".wpx-exports")) {
+      if (zone.querySelector(":scope > .wpx-vr-btn")) continue;
+      const exporter = zone.querySelector(":scope > button");
+      const bouton = h("button", { type: "button", class: "wpx-btn wpx-vr-btn", "aria-pressed": "false",
+        title: "Verrouiller ou déverrouiller les cartes des étiquettes cochées", onclick: ouvrirVerrou }, SVG_FERME, h("span", null, "Verrouiller"));
+      if (exporter) exporter.before(bouton);
+      else zone.append(bouton);
+    }
+  }
+
+  function majBoutons(on) {
+    $$(".wpx-vr-btn").forEach(b => b.setAttribute("aria-pressed", String(on)));
   }
 
   function toast(texte) {
@@ -764,7 +1022,8 @@
 .wpx-vr-tete .wpx-btn svg,.wpx-vr-cat-tete .wpx-btn svg{width:13px;height:13px}
 .wpx-vr-stop{display:none!important}
 .wpx-vr-en .wpx-vr-stop{display:inline-flex!important}
-.wpx-vr-jbtn[aria-pressed="true"]{background:var(--wpx-degrade,#7c3aed);border-color:transparent;color:#fff}
+.wpx-vr-btn svg{width:15px;height:15px}
+.wpx-vr-btn[aria-pressed="true"],.wpx-vr-jbtn[aria-pressed="true"]{background:var(--wpx-degrade,#7c3aed);border-color:transparent;color:#fff}
 .wpx-vr-progres{margin:4px 0 10px;padding:9px 10px;border:1px solid var(--wpx-bord,rgba(167,139,250,.16));border-radius:10px;background:rgba(255,255,255,.03)}
 .wpx-vr-progres-tete{display:flex;align-items:center;gap:8px;margin-bottom:7px}
 .wpx-vr-statut{font:800 13px Sora,Inter,sans-serif}
@@ -793,6 +1052,7 @@
 .wpx-vr-ligne:hover{background:rgba(255,255,255,.05)}
 .wpx-vr-ligne>span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .wpx-vr-ligne>small{flex:0 0 auto;color:var(--wpx-pale,#6b6485);font-size:11px}
+.wpx-vr-ligne.wpx-vr-fermee>small{color:#fde68a}
 .wpx-vr-ico{display:grid;place-items:center;width:30px;height:26px;padding:0;border:1px solid var(--wpx-bord,rgba(167,139,250,.16));border-radius:8px;background:rgba(255,255,255,.03);color:inherit;cursor:pointer}
 .wpx-vr-ico:hover{background:rgba(255,255,255,.09)}
 .wpx-vr-ico svg{width:14px;height:14px}
@@ -818,47 +1078,73 @@
     installerBouton();
     const t = $("#wpx-tiroir");
     if (!t) return;
+    suivreTiroir(t);
     installerDansTiroir(t);
     const dedans = t.classList.contains("wpx-ouvert") && t.classList.contains("wpx-vr-on");
     if (ETAT.dedans && !dedans) {
       if (t.classList.contains("wpx-vr-on")) {
         t.classList.remove("wpx-vr-on");
-        if (ETAT.bouton) ETAT.bouton.setAttribute("aria-pressed", "false");
+        majBoutons(false);
       }
       ETAT.dedans = false;
-      viderEnQuittant();
+      quitterPanneau();
       return;
     }
-    if (dedans && !ETAT.dedans) ETAT.aVider = false;
+    const retour = dedans && !ETAT.dedans;
     ETAT.dedans = dedans;
-    if (t.classList.contains("wpx-vr-on") && ETAT.panneau) {
-      const signature = signatureSelection();
-      if (signature !== ETAT.signature) rafraichirPanneau();
+    if (!dedans || !ETAT.panneau) return;
+    if (retour) {
+      // de retour dans le panneau : le journal et la liste reprennent où ils en étaient
+      ETAT.journal.textContent = LOG.length ? texteAffiche() : "";
+      rafraichirApres();
     }
+    const signature = signatureSelection();
+    if (retour || signature !== ETAT.signature) rafraichirPanneau();
   }
 
   function planifier() {
     if (!ETAT.planifie) ETAT.planifie = requestAnimationFrame(verifier);
   }
 
-  function mutationUtile(m) {
-    const cible = m.target;
-    if (cible.nodeType !== 1) return true;
-    if (cible.closest(".wpx-vr-panel, #wpx-vr-journal-panel")) return false;
-    if (m.type === "attributes") return !!cible.closest("#wpx-tiroir");
-    if (cible === document.body) {
-      const noeuds = [...m.addedNodes, ...m.removedNodes];
-      if (noeuds.length && noeuds.every(n => n.nodeType === 1 && n.classList.contains("wpx-vr-toast"))) return false;
-    }
-    return true;
+  /* (3.2) Ce qui faisait ramer le site : l'outil regardait chaque changement de toute la page (et chaque classe qui
+     change en défilant), et relisait alors toutes les étiquettes affichées. Maintenant :
+     - le tiroir a son propre observateur (sélection, ouverture, changement de mode) ;
+     - dans le reste de la page, seuls comptent un tiroir ou une barre d'export qui apparaît sans son bouton, et,
+       panneau ouvert, les étiquettes qui changent ;
+     - panneau fermé, plus rien d'autre. */
+  let tiroirSuivi = null;
+  const observateurTiroir = new MutationObserver(planifier);
+  function suivreTiroir(t) {
+    if (tiroirSuivi === t) return;
+    observateurTiroir.disconnect();
+    observateurTiroir.observe(t, { attributes: true, attributeFilter: ["class", "aria-selected"], subtree: true });
+    tiroirSuivi = t;
   }
 
+  const DANS_OUTIL = ".wpx-vr-panel, #wpx-vr-journal-panel, .wpx-vr-toast, .wpx-vr-btn";
+  function mutationUtile(m) {
+    const cible = m.target;
+    if (cible.nodeType !== 1 || cible.closest(DANS_OUTIL)) return false;
+    // un bouton à reposer : une barre d'export sans le sien, ou le tiroir qui arrive
+    for (const n of m.addedNodes) {
+      if (n.nodeType !== 1) continue;
+      if (n.id === "wpx-tiroir" || n.matches(".wpx-exports, .wpx-barre") || n.querySelector(".wpx-exports")) return true;
+    }
+    if (cible.matches(".wpx-exports, .wpx-barre")) return true;
+    // panneau ouvert : les étiquettes de la page (une section chargée, ajoutée ou retirée)
+    if (ETAT.dedans && (cible.closest("section.album") || [...m.addedNodes, ...m.removedNodes].some(n => n.nodeType === 1 && n.matches("section.album")))) return true;
+    return false;
+  }
+
+  restaurerSession();
   installerStyles();
   new MutationObserver(mutations => {
     if (ETAT.planifie) return;
     for (const m of mutations) {
       if (mutationUtile(m)) { planifier(); return; }
     }
-  }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "aria-selected"] });
+  }).observe(document.body, { childList: true, subtree: true });
   setTimeout(planifier, 1500);
+  // (3.6) le bouton Verrouiller, reposé à côté d'Exporter si la barre a été redessinée sans que l'observateur le voie
+  setInterval(installerBouton, 2000);
 })();
