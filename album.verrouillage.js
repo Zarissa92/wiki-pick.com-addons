@@ -1,61 +1,43 @@
 // ==UserScript==
 // @name         [test]Wiki-Pick verrouillage (tiroir d'export)
 // @namespace    local.wikipick.lock
-// @version      2.18
-// @description  Verrouille ou déverrouille les cartes d'étiquettes, ou une à une, depuis le tiroir d'export d'Album+cleaner
+// @version      2.19
+// @description  Verrouille ou déverrouille les cartes d'étiquettes depuis le tiroir d'export d'Album+cleaner (à côté de Clean et Largeur)
 // @match        https://wiki-pick.com/*
 // @grant        none
 // @run-at       document-idle
 // @noframes
-// @homepageURL  https://github.com/Zarissa92/wiki-pick.com-addons
-// @updateURL    https://raw.githubusercontent.com/Zarissa92/wiki-pick.com-addons/main/album.verrouillage.js
-// @downloadURL  https://raw.githubusercontent.com/Zarissa92/wiki-pick.com-addons/main/album.verrouillage.js
 // ==/UserScript==
 
 (function () {
   "use strict";
 
-  // ===== PARAMÈTRES MODIFIABLES =====
-  // (2.8) verrouillages : un seul à la fois, et ce délai entre la fin de l'un et le départ du suivant.
-  // Les lectures des copies, elles, restent rapides (LECTURES_SIMULTANEES en parallèle, sans délai).
-  const DELAI_ENTRE_VERROUILLAGES_MS = 1200;
-  // (2.18) un lot = un seul envoi groupé d'exemplaires, comme le fait le site.
-  // Si le site refuse les gros envois, baisse TAILLE_LOT.
-  const CONFIRMATION_A_PARTIR_DE = 10;       // demande confirmation au-delà de ce nombre de cartes
-  // (2.17) cartes traitées par lot : chaque lot est lu carte par carte, puis envoyé
-  const TAILLE_LOT = 100;
-  const LECTURES_SIMULTANEES = 1;            // lectures de la collection en parallèle, dans un lot
-  const PAUSE_ENTRE_LOTS_MS = 2000;          // pause entre deux lots
-  // (2.10) quand le site répond 429 (« trop de requêtes ») : toutes les requêtes de l'outil s'arrêtent le temps demandé
-  // par le site (en-tête Retry-After), sinon ATTENTE_429_MS, doublée à chaque nouveau refus, puis la même requête repart
-  const REESSAIS_429 = 5;                    // nouveaux essais au plus pour une même requête
-  const ATTENTE_429_MS = 5000;               // première attente si le site ne dit pas combien
-  const ATTENTE_429_MAX_MS = 120000;         // jamais plus de 2 min d'un coup
+  // ===== PARAMÈTRES =====
+  const DELAI_ENTRE_VERROUILLAGES_MS = 900;
+  const CONFIRMATION_A_PARTIR_DE = 10;
+  const TAILLE_LOT = 50;
+  const LECTURES_SIMULTANEES = 25;
+  const PAUSE_ENTRE_LOTS_MS = 2000;
+  const REESSAIS_429 = 5;
+  const ATTENTE_429_MS = 5000;
+  const ATTENTE_429_MAX_MS = 120000;
   const URL_SITE = "https://wiki-pick.com";
-  const LIGNES_AFFICHEES_MAX = 300;          // lignes du journal affichées à l'écran (tout reste dans l'export)
-  const LIGNES_GARDEES_MAX = 20000;          // lignes gardées en mémoire pour l'export
-  // caches de l'outil Album+cleaner que « Vider la mémoire » peut retirer (jamais ses réglages, paquets ni serveurs)
+  const LIGNES_AFFICHEES_MAX = 300;
+  const LIGNES_GARDEES_MAX = 20000;
   const PREFIXES_CACHE_OUTIL = ["wpx.aDeja.", "wpx.chances.comptes", "wpx.discord.achats"];
-  // (2.6) en quittant le panneau de verrouillage (autre mode du tiroir, tiroir fermé, autre page), tout est vidé :
-  // journal, liste des cartes, proposition « inverse », progression, fenêtre du journal, et ces caches de l'outil.
-  // wpx.discord.achats n'y est pas : l'effacer à chaque sortie ferait repartir vers Discord les achats des 2 dernières heures.
-  const VIDER_EN_QUITTANT = true;
   const CACHES_VIDES_EN_QUITTANT = ["wpx.aDeja.", "wpx.chances.comptes"];
-  // (2.16) en quittant le panneau de verrouillage, la page se recharge (F5) : affichage et mémoire repartent de zéro.
-  // Si un traitement tourne encore, le rechargement attend sa fin.
-  const RAFRAICHIR_EN_QUITTANT = true;
   // ===== FIN DES PARAMÈTRES =====
 
   if (window.__wpxVerrouActif) return;
   window.__wpxVerrouActif = true;
 
   const RUN = { en: false, stop: false };
-  const DERNIER = { cartes: null, on: null };   // dernier traitement terminé, pour proposer l'inverse
-  const LOG = [];                                // tout le journal de la session : affiché et exporté
+  const DERNIER = { cartes: null, on: null };
+  const LOG = [];
   const JRN = { vue: null, corps: null, compte: null };
-  const ETAT = { panneau: null, journal: null, resume: null, corps: null, signature: "", planifie: 0, mode: null,
+  const ETAT = { panneau: null, journal: null, resume: null, corps: null, signature: "", planifie: 0,
                  statut: null, compte: null, fill: null, detail: null, apres: null, bouton: null, groupes: [],
-                 dedans: false, aVider: false };   // dedans : le panneau est affiché ; aVider : à vider à la fin du traitement
+                 dedans: false, aVider: false };
 
   const SVG_FERME = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
   const SVG_OUVERT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.7-1.5"/></svg>';
@@ -69,43 +51,30 @@
   const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
   const p2 = n => String(n).padStart(2, "0");
 
-  // Les icônes SVG sont analysées une seule fois, puis clonées
-  const CACHE_SVG = new Map();
-  function svg(code) {
-    let modele = CACHE_SVG.get(code);
-    if (!modele) {
-      modele = document.createElement("template");
-      modele.innerHTML = code.trim();
-      CACHE_SVG.set(code, modele);
-    }
-    return modele.content.cloneNode(true);
-  }
-
   function h(tag, attrs, ...enfants) {
     const e = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) {
       if (v == null || v === false) continue;
       if (k === "class") e.className = v;
-      else if (k === "html") e.innerHTML = v;
       else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
       else e.setAttribute(k, v === true ? "" : String(v));
     }
     for (const c of enfants.flat(Infinity)) {
       if (c == null || c === false) continue;
-      if (typeof c === "string" && c.trim().startsWith("<svg")) { e.append(svg(c)); continue; }
+      if (typeof c === "string" && c.trim().startsWith("<svg")) {
+        const t = document.createElement("template");
+        t.innerHTML = c.trim();
+        e.append(t.content.cloneNode(true));
+        continue;
+      }
       e.append(typeof c === "object" ? c : String(c));
     }
     return e;
   }
 
-  // Même nom d'étiquette que le script d'export (titre sans pastille, compteur ni flèches).
-  // Lu sans cloner le titre, et mis en cache tant que le texte du titre ne change pas.
+  // ---------- Lecture de la sélection dans le tiroir ----------
   const EXCLUS_TITRE = "small, .albpastille, .albfleches, .pdico, button";
-  const CACHE_NOMS = new WeakMap();
   function nomDuTitre(titre) {
-    const brut = titre.textContent;
-    const memo = CACHE_NOMS.get(titre);
-    if (memo && memo.brut === brut) return memo.nom;
     let texte = "";
     const w = document.createTreeWalker(titre, NodeFilter.SHOW_TEXT);
     for (let n = w.nextNode(); n; n = w.nextNode()) {
@@ -113,9 +82,7 @@
       if (exclu && titre.contains(exclu)) continue;
       texte += n.data;
     }
-    const nom = propre(texte);
-    CACHE_NOMS.set(titre, { brut, nom });
-    return nom;
+    return propre(texte);
   }
 
   function sectionsParNom() {
@@ -129,7 +96,6 @@
     return map;
   }
 
-  // Cartes d'une étiquette, sans doublon. cle = cid + "#sh" / "#hw" selon la version
   function cartesDeSection(section) {
     const vues = new Set();
     const liste = [];
@@ -143,7 +109,6 @@
     return liste;
   }
 
-  // Étiquettes cochées dans le tiroir, dans l'ordre affiché
   function etiquettesChoisies() {
     const tiroir = $("#wpx-tiroir");
     if (!tiroir) return [];
@@ -156,7 +121,6 @@
     });
   }
 
-  // Étiquettes cochées avec leurs cartes, calculées en une seule passe
   function groupesChoisis() {
     return etiquettesChoisies().map(e => ({ nom: e.nom, cartes: e.section ? cartesDeSection(e.section) : null }));
   }
@@ -176,21 +140,18 @@
     return fusionner(groupesChoisis());
   }
 
-  // Signature légère pour détecter un changement de sélection ou de cartes chargées
   function signatureSelection() {
     return etiquettesChoisies()
       .map(e => e.nom + ":" + (e.section ? e.section.querySelectorAll(".card[data-cle]").length : "x"))
       .join("|");
   }
 
-  // ---------- API ----------
-  // Une requête au site qui sait attendre : si le site répond 429, tout l'outil (lectures et verrouillages) fait une
-  // pause commune, puis la même requête repart. Après REESSAIS_429 refus, la réponse 429 est rendue telle quelle.
+  // ---------- Requêtes au site ----------
   const FREIN = { jusqua: 0 };
   function attente429(res, essai) {
     const brut = res.headers.get("Retry-After");
-    let ms = Number(brut) * 1000;                                    // en secondes…
-    if (!(ms > 0) && brut) ms = Date.parse(brut) - Date.now();       // … ou une date
+    let ms = Number(brut) * 1000;
+    if (!(ms > 0) && brut) ms = Date.parse(brut) - Date.now();
     if (!(ms > 0)) ms = ATTENTE_429_MS * 2 ** essai;
     return Math.min(Math.max(ms, 1000) + 250, ATTENTE_429_MAX_MS);
   }
@@ -207,8 +168,6 @@
     }
   }
 
-  // Les verrouillages passent par ici : un à la fois, DELAI_ENTRE_VERROUILLAGES_MS après la fin du précédent
-  // (réussi ou non). Les lectures n'y passent pas.
   const PORTE = { file: Promise.resolve(), finie: 0 };
   function requeteVerrou(url, options) {
     const tour = PORTE.file.then(async () => {
@@ -220,7 +179,7 @@
         PORTE.finie = Date.now();
       }
     });
-    PORTE.file = tour.catch(() => {});      // une requête ratée ne bloque pas les suivantes
+    PORTE.file = tour.catch(() => {});
     return tour;
   }
 
@@ -232,29 +191,22 @@
     return mine.filter(m => Number.isInteger(m.id));
   }
 
-  // Ne touche que l'exemplaire de la même version (normale, chromatique, Halloween)
   const MEME_VERSION = (m, c) => !!m.sh === c.sh && !!m.hw === c.hw;
-
-  // Une copie est verrouillée quand son état vaut "locked" (champ state de /api/card)
   const EST_VERROUILLEE = m => m.state === "locked";
 
   async function setVerrou(card_id, on) {
     const res = await requeteVerrou(URL_SITE + "/api/card/lock", {
-      method: "POST",
-      credentials: "include",
+      method: "POST", credentials: "include",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ card_id, on }),
     });
     return res.status;
   }
 
-  // (2.14) Plusieurs exemplaires d'un coup, comme le site : POST /api/card/lock/bulk {on, ids:[…]}.
-  // Si le site ne connaît pas cette adresse (404, 405), l'outil revient au verrouillage carte par carte pour la session.
   const GROUPE = { possible: true };
   async function setVerrouGroupe(ids, on) {
     const res = await requeteVerrou(URL_SITE + "/api/card/lock/bulk", {
-      method: "POST",
-      credentials: "include",
+      method: "POST", credentials: "include",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ on, ids }),
     });
@@ -262,8 +214,6 @@
     return res.status;
   }
 
-  // (2.17) Lit les copies de toutes les cartes d'un lot, carte par carte (LECTURES_SIMULTANEES à la fois).
-  // Chaque cid n'est lu qu'une fois par lot ; le résultat va dans `copies` : {copies} ou {erreur}.
   async function lireLot(lot, copies, progres) {
     const cids = [...new Set(lot.map(c => c.cid))];
     let suivant = 0;
@@ -287,14 +237,12 @@
   const heure = d => p2(d.getHours()) + ":" + p2(d.getMinutes()) + ":" + p2(d.getSeconds());
   const texteJournal = () => LOG.map(l => `[${heure(l.t)}] ${l.msg}`).join("\n");
 
-  // texte affiché : seulement les dernières lignes, pour ne pas alourdir la page
   function texteAffiche() {
     const debut = Math.max(0, LOG.length - LIGNES_AFFICHEES_MAX);
     const entete = debut ? `… ${nombre(debut)} ligne(s) plus anciennes, présentes dans l'export .txt\n` : "";
     return entete + LOG.slice(debut).map(l => `[${heure(l.t)}] ${l.msg}`).join("\n") + "\n";
   }
 
-  // ne garde à l'écran que les derniers nœuds de texte d'une zone
   function limiterAffichage(zone) {
     while (zone.childNodes.length > LIGNES_AFFICHEES_MAX) zone.removeChild(zone.firstChild);
   }
@@ -305,7 +253,7 @@
     if (LOG.length > LIGNES_GARDEES_MAX) LOG.splice(0, LOG.length - LIGNES_GARDEES_MAX);
     const texte = `[${heure(ligne.t)}] ${msg}\n`;
     if (ETAT.journal) {
-      ETAT.journal.append(document.createTextNode(texte));   // ajout sans réécrire tout le texte
+      ETAT.journal.append(document.createTextNode(texte));
       limiterAffichage(ETAT.journal);
       ETAT.journal.scrollTop = ETAT.journal.scrollHeight;
     }
@@ -329,10 +277,10 @@
       h("header", { class: "wpx-jr-tete" },
         h("b", null, "Journal du verrouillage"),
         JRN.compte,
-        h("button", { type: "button", class: "wpx-btn", title: "Télécharger le journal en fichier .txt", onclick: exporterJournal }, "Exporter .txt"),
-        h("button", { type: "button", class: "wpx-btn", title: "Copier le journal dans le presse-papiers", onclick: copierJournal }, "Copier"),
+        h("button", { type: "button", class: "wpx-btn", title: "Télécharger le journal en .txt", onclick: exporterJournal }, "Exporter .txt"),
+        h("button", { type: "button", class: "wpx-btn", title: "Copier le journal", onclick: copierJournal }, "Copier"),
         h("button", { type: "button", class: "wpx-btn", title: "Effacer le journal", onclick: viderJournal }, "Vider"),
-        h("button", { type: "button", class: "wpx-btn", title: "Effacer le journal et le cache de l'outil pour alléger la page", onclick: viderMemoire }, "Vider la mémoire"),
+        h("button", { type: "button", class: "wpx-btn", title: "Effacer le journal et le cache de l'outil", onclick: viderMemoire }, "Vider la mémoire"),
         h("button", { type: "button", class: "wpx-btn", title: "Fermer le journal", "aria-label": "Fermer le journal", onclick: fermerJournal }, "✕")),
       JRN.corps);
     document.body.append(JRN.vue);
@@ -398,53 +346,43 @@
     if (JRN.vue) remplirJournal();
   }
 
-  // Caches de l'outil Album+cleaner présents dans ce navigateur
-  function cachesOutil() {
+  function cachesOutil(prefixes) {
     const cles = [];
     try {
       for (let i = 0; i < localStorage.length; i++) {
         const k = localStorage.key(i);
-        if (PREFIXES_CACHE_OUTIL.some(p => k.startsWith(p))) cles.push(k);
+        if (prefixes.some(p => k.startsWith(p))) cles.push(k);
       }
     } catch (e) { /* stockage indisponible */ }
     return cles;
   }
 
-  // Efface le journal (affiché et gardé en mémoire) et les caches de l'outil Album+cleaner.
-  // Rien d'autre : réglages, derniers paquets, serveurs Discord et file d'envoi sont conservés.
   function viderMemoire() {
     if (RUN.en) return toast("Attends la fin du traitement pour vider la mémoire.");
-    const cles = cachesOutil();
+    const cles = cachesOutil(PREFIXES_CACHE_OUTIL);
     let octets = 0;
     for (const k of cles) {
-      try { octets += (localStorage.getItem(k) || "").length; } catch (e) { /* illisible : compté comme rien */ }
+      try { octets += (localStorage.getItem(k) || "").length; } catch (e) { /* compté comme rien */ }
     }
     const ko = Math.max(1, Math.round(octets / 1024));
     if (!confirm(
       "Vider la mémoire ?\n\n" +
       `• Journal : ${nombre(LOG.length)} ligne(s) effacée(s). Exporte-le avant si tu veux le garder.\n` +
-      `• Cache de l'outil Album+cleaner : ${nombre(cles.length)} entrée(s), environ ${nombre(ko)} Ko\n` +
-      "  (collections des partenaires d'échange déjà lues, comptes des chances, achats Discord déjà lus).\n\n" +
+      `• Cache de l'outil : ${nombre(cles.length)} entrée(s), environ ${nombre(ko)} Ko\n\n` +
       "Ne sont pas touchés : tes réglages, tes derniers paquets, tes serveurs Discord, la file d'envoi.")) return;
     LOG.length = 0;
     if (ETAT.journal) ETAT.journal.textContent = "";
     if (JRN.vue) remplirJournal();
     let retirees = 0;
     for (const k of cles) {
-      try { localStorage.removeItem(k); retirees++; } catch (e) { /* on passe à la suivante */ }
+      try { localStorage.removeItem(k); retirees++; } catch (e) { /* suivante */ }
     }
     majCompteJournal();
     toast(`Mémoire vidée : journal effacé, ${nombre(retirees)} entrée(s) de cache retirée(s).`);
   }
 
-  // En quittant le panneau : tout est vidé, sans confirmation (exporte le journal avant de sortir si tu veux le garder).
-  // Un traitement en cours continue : le vidage se fait à sa fin, si tu n'es pas revenu dans le panneau entre-temps.
-  function rafraichirSiDemande() {
-    if (RAFRAICHIR_EN_QUITTANT) location.reload();
-  }
-
+  // En quittant le panneau : journal et caches vidés. Pas de rechargement de la page.
   function viderEnQuittant() {
-    if (!VIDER_EN_QUITTANT) return rafraichirSiDemande();
     if (RUN.en) { ETAT.aVider = true; return; }
     ETAT.aVider = false;
     LOG.length = 0;
@@ -452,7 +390,7 @@
     DERNIER.on = null;
     ETAT.groupes = [];
     ETAT.signature = "";
-    if (ETAT.corps) ETAT.corps.replaceChildren();          // les milliers de lignes de cartes quittent la page
+    if (ETAT.corps) ETAT.corps.replaceChildren();
     if (ETAT.journal) ETAT.journal.textContent = "";
     if (ETAT.resume) ETAT.resume.textContent = "";
     rafraichirApres();
@@ -464,18 +402,11 @@
     majBoutonsJournal();
     majCompteJournal();
     try {
-      const cles = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (CACHES_VIDES_EN_QUITTANT.some(p => k.startsWith(p))) cles.push(k);
-      }
-      cles.forEach(k => localStorage.removeItem(k));
-    } catch (e) { /* stockage indisponible : rien à retirer */ }
-    rafraichirSiDemande();
+      for (const k of cachesOutil(CACHES_VIDES_EN_QUITTANT)) localStorage.removeItem(k);
+    } catch (e) { /* rien à retirer */ }
   }
 
   // ---------- Progression ----------
-  // etat : "" (neutre), "en" (en cours), "ok" (fini), "stop" (arrêté), "err" (fini avec erreurs)
   function setProgres({ fait = 0, total = 0, statut = "Prêt", etat = "", detail = "" }) {
     if (!ETAT.fill) return;
     const pct = total ? Math.round((fait / total) * 100) : 0;
@@ -487,7 +418,6 @@
     ETAT.detail.textContent = detail;
   }
 
-  // Active ou désactive les boutons selon qu'un traitement tourne, sans reconstruire la liste
   function majEtatTraitement() {
     const p = ETAT.panneau;
     if (!p) return;
@@ -503,14 +433,8 @@
     const total = cartes.length;
     const fait_mot = on ? "verrouillée(s)" : "déverrouillée(s)";
     const deja_mot = on ? "déjà verrouillée(s)" : "déjà déverrouillée(s)";
-    let fait = 0;              // cartes traitées (pour la barre)
-    let cartesModifiees = 0;   // cartes dont au moins un exemplaire a changé d'état
-    let cartesDeja = 0;        // cartes déjà dans l'état demandé
-    let cartesAbsentes = 0;    // cartes qui ne sont pas dans ta collection
-    let exemplaires = 0;       // exemplaires modifiés
-    let erreurs = 0;
+    let fait = 0, cartesModifiees = 0, cartesDeja = 0, cartesAbsentes = 0, exemplaires = 0, erreurs = 0;
 
-    // découpage en lots de TAILLE_LOT cartes
     const lots = [];
     for (let i = 0; i < cartes.length; i += TAILLE_LOT) lots.push(cartes.slice(i, i + TAILLE_LOT));
 
@@ -524,14 +448,12 @@
         const libelleLot = `Lot ${li + 1}/${lots.length}`;
         journal(`--- ${libelleLot} : ${pluriel(lot.length, "carte")} ---`);
 
-        // 1) lecture des copies du lot, carte par carte
         const copies = new Map();
         await lireLot(lot, copies, (lus, nb) => {
           setProgres({ fait, total, statut: "En cours", etat: "en", detail: `${libelleLot} · lecture des copies ${lus} / ${nb}` });
         });
 
-        // 2) tri : ce qui est absent ou déjà dans l'état demandé ne part pas au site
-        const aEnvoyer = [];            // {c, etiquette, ids} : les exemplaires à changer, carte par carte
+        const aEnvoyer = [];
         for (const c of lot) {
           if (RUN.stop) break;
           const etiquette = c.sh ? " (chromatique)" : c.hw ? " (Halloween)" : "";
@@ -561,16 +483,14 @@
         }
         setProgres({ fait, total, statut: "En cours", etat: "en", detail: `${libelleLot} · ${pluriel(aEnvoyer.length, "carte")} à ${on ? "verrouiller" : "déverrouiller"}` });
 
-        // 3) (2.18) un seul envoi par lot : tous les exemplaires à changer du lot partent ensemble
-        const groupes = aEnvoyer.length ? [aEnvoyer] : [];
-
-        for (let gi = 0; gi < groupes.length && !RUN.stop; gi++) {
-          const groupe = groupes[gi];
+        if (aEnvoyer.length && !RUN.stop) {
+          const groupe = aEnvoyer;
           const ids = groupe.flatMap(x => x.ids);
           setProgres({ fait, total, statut: "En cours", etat: "en",
             detail: `${libelleLot} · envoi : ${pluriel(groupe.length, "carte")}, ${pluriel(ids.length, "exemplaire")}` });
-          let reussi = false;
+          let traite = false;
           if (GROUPE.possible && ids.length > 1) {
+            let reussi = false;
             try {
               const statut = await setVerrouGroupe(ids, on);
               reussi = statut >= 200 && statut < 300;
@@ -588,30 +508,29 @@
               erreurs++;
               journal("Erreur sur l'envoi groupé : " + e.message);
             }
-            if (reussi || GROUPE.possible) {
-              fait += groupe.length;
-              continue;
-            }
+            traite = reussi || GROUPE.possible;
+            if (traite) fait += groupe.length;
           }
-          // carte par carte : un seul exemplaire à changer, ou le site refuse l'envoi groupé
-          for (const x of groupe) {
-            if (RUN.stop) break;
-            let modifiees = 0;
-            for (const id of x.ids) {
+          if (!traite) {
+            for (const x of groupe) {
               if (RUN.stop) break;
-              try {
-                const statut = await setVerrou(id, on);
-                if (statut >= 200 && statut < 300) { modifiees++; exemplaires++; }
-                else erreurs++;
-                journal(`${statut}  ${x.c.nom}${x.etiquette}  (id ${id})`);
-              } catch (e) {
-                erreurs++;
-                journal("Erreur  " + x.c.nom + " : " + e.message);
+              let modifiees = 0;
+              for (const id of x.ids) {
+                if (RUN.stop) break;
+                try {
+                  const statut = await setVerrou(id, on);
+                  if (statut >= 200 && statut < 300) { modifiees++; exemplaires++; }
+                  else erreurs++;
+                  journal(`${statut}  ${x.c.nom}${x.etiquette}  (id ${id})`);
+                } catch (e) {
+                  erreurs++;
+                  journal("Erreur  " + x.c.nom + " : " + e.message);
+                }
               }
+              if (modifiees) cartesModifiees++;
+              fait++;
+              setProgres({ fait, total, statut: "En cours", etat: "en", detail: `${libelleLot} · dernière carte traitée : ${x.c.nom}` });
             }
-            if (modifiees) cartesModifiees++;
-            fait++;
-            setProgres({ fait, total, statut: "En cours", etat: "en", detail: `${libelleLot} · dernière carte traitée : ${x.c.nom}` });
           }
         }
 
@@ -635,11 +554,9 @@
         statut = "Arrêté"; etat = "stop";
         detail = `Arrêté après ${nombre(fait)} carte(s) sur ${nombre(total)} · ${bilan}`;
       } else if (erreurs) {
-        statut = "Terminé avec erreurs"; etat = "err";
-        detail = bilan;
+        statut = "Terminé avec erreurs"; etat = "err"; detail = bilan;
       } else {
-        statut = "Terminé"; etat = "ok";
-        detail = bilan;
+        statut = "Terminé"; etat = "ok"; detail = bilan;
       }
       setProgres({ fait, total, statut, etat, detail });
       journal("Bilan : " + bilan);
@@ -647,16 +564,15 @@
       DERNIER.cartes = cartes;
       DERNIER.on = on;
       majEtatTraitement();
-      if (ETAT.aVider && !ETAT.dedans) viderEnQuittant();   // on avait quitté le panneau pendant le traitement
+      if (ETAT.aVider && !ETAT.dedans) viderEnQuittant();
     }
   }
 
-  // Lance un traitement, après confirmation au-delà du seuil
   function lancer(cartes, on) {
     if (!cartes.length) return journal("Aucune carte : coche une étiquette chargée sur la page.");
     if (cartes.length > CONFIRMATION_A_PARTIR_DE && !confirm(
       `${on ? "Verrouiller" : "Déverrouiller"} ${pluriel(cartes.length, "carte")} ?\n` +
-      `Les cartes sont traitées par lots de ${TAILLE_LOT} : chaque lot part en un seul envoi, ${PAUSE_ENTRE_LOTS_MS / 1000} s entre deux lots ; ` +
+      `Traitées par lots de ${TAILLE_LOT} : chaque lot part en un seul envoi, ${PAUSE_ENTRE_LOTS_MS / 1000} s entre deux lots ; ` +
       `les cartes déjà dans l'état demandé sont ignorées.`)) return;
     traiter(cartes, on);
   }
@@ -676,7 +592,6 @@
     ETAT.signature = signatureSelection();
     ETAT.resume.textContent = pluriel(groupes.length, "étiquette") + " · " + pluriel(tous.length, "carte") + " à traiter";
 
-    const corps = ETAT.corps;
     const frag = document.createDocumentFragment();
     if (!groupes.length) frag.append(h("p", { class: "wpx-vr-vide" }, "Coche des étiquettes dans la liste ci-dessus : leurs cartes apparaissent ici."));
     groupes.forEach((g, gi) => {
@@ -685,10 +600,8 @@
         h("small", null, g.cartes ? pluriel(g.cartes.length, "carte") : "cartes non chargées"));
       if (g.cartes && g.cartes.length) {
         tete.append(
-          h("button", { type: "button", class: "wpx-btn wpx-vr-act", title: "Verrouiller toutes les cartes de cette étiquette",
-            "data-act": "on", "data-g": gi }, SVG_FERME, "Tout verrouiller"),
-          h("button", { type: "button", class: "wpx-btn wpx-vr-act", title: "Déverrouiller toutes les cartes de cette étiquette",
-            "data-act": "off", "data-g": gi }, SVG_OUVERT, "Tout déverrouiller"));
+          h("button", { type: "button", class: "wpx-btn wpx-vr-act", title: "Verrouiller toutes les cartes de cette étiquette", "data-act": "on", "data-g": gi }, SVG_FERME, "Tout verrouiller"),
+          h("button", { type: "button", class: "wpx-btn wpx-vr-act", title: "Déverrouiller toutes les cartes de cette étiquette", "data-act": "off", "data-g": gi }, SVG_OUVERT, "Tout déverrouiller"));
       }
       bloc.append(tete);
       (g.cartes || []).forEach((c, ci) => {
@@ -696,19 +609,16 @@
         bloc.append(h("div", { class: "wpx-vr-ligne" },
           h("span", { title: c.nom }, c.nom),
           suffixe ? h("small", null, suffixe) : null,
-          h("button", { type: "button", class: "wpx-vr-ico wpx-vr-act", title: "Verrouiller cette carte", "aria-label": "Verrouiller " + c.nom,
-            "data-act": "on", "data-g": gi, "data-i": ci }, SVG_FERME),
-          h("button", { type: "button", class: "wpx-vr-ico wpx-vr-act", title: "Déverrouiller cette carte", "aria-label": "Déverrouiller " + c.nom,
-            "data-act": "off", "data-g": gi, "data-i": ci }, SVG_OUVERT)));
+          h("button", { type: "button", class: "wpx-vr-ico wpx-vr-act", title: "Verrouiller cette carte", "aria-label": "Verrouiller " + c.nom, "data-act": "on", "data-g": gi, "data-i": ci }, SVG_FERME),
+          h("button", { type: "button", class: "wpx-vr-ico wpx-vr-act", title: "Déverrouiller cette carte", "aria-label": "Déverrouiller " + c.nom, "data-act": "off", "data-g": gi, "data-i": ci }, SVG_OUVERT)));
       });
       frag.append(bloc);
     });
-    corps.replaceChildren(frag);
+    ETAT.corps.replaceChildren(frag);
     $$(".wpx-vr-act", p).forEach(b => { b.disabled = RUN.en; });
     rafraichirApres();
   }
 
-  // Un seul écouteur pour tous les boutons des étiquettes et des cartes
   function clicListe(e) {
     const b = e.target.closest("button[data-act]");
     if (!b || b.disabled || !ETAT.corps.contains(b)) return;
@@ -723,7 +633,6 @@
     }
   }
 
-  // Bandeau de fin de traitement : propose l'action inverse sur les mêmes cartes
   function rafraichirApres() {
     const a = ETAT.apres;
     if (!a) return;
@@ -733,10 +642,9 @@
       return;
     }
     const inverse = !DERNIER.on;
-    const nombreCartes = pluriel(DERNIER.cartes.length, "carte");
     a.hidden = false;
     a.replaceChildren(
-      h("span", null, `Traitement terminé. Tu veux ${inverse ? "verrouiller" : "déverrouiller"} ces ${nombreCartes} maintenant ?`),
+      h("span", null, `Traitement terminé. Tu veux ${inverse ? "verrouiller" : "déverrouiller"} ces ${pluriel(DERNIER.cartes.length, "carte")} maintenant ?`),
       h("button", { type: "button", class: "wpx-btn wpx-vr-act", onclick: () => lancer(DERNIER.cartes, inverse) },
         inverse ? SVG_FERME : SVG_OUVERT, inverse ? "Verrouiller ces cartes" : "Déverrouiller ces cartes"),
       h("button", { type: "button", class: "wpx-lien", onclick: () => { DERNIER.cartes = null; rafraichirApres(); } }, "Non, merci"));
@@ -749,8 +657,6 @@
     const res = $(".wpx-t-res", t);
     if (!seg || !res) return;
 
-    // (2.12) pas de bouton « Verrouiller » dans le tiroir : on y entre par le cadenas du haut du site. Un clic sur
-    // « Exporter les étiquettes » ou « Extraire les cartes » ramène le tiroir à l'export.
     seg.addEventListener("click", e => {
       if (e.target.closest("[data-mode]")) basculerMode(false);
     });
@@ -764,8 +670,8 @@
     ETAT.detail = h("small", { class: "wpx-vr-detail" });
     ETAT.apres = h("div", { class: "wpx-vr-apres", hidden: true });
     const stop = h("button", { type: "button", class: "wpx-btn wpx-vr-stop", onclick: () => { RUN.stop = true; journal("Arrêt demandé après la carte en cours…"); ETAT.detail.textContent = "Arrêt demandé, après la carte en cours…"; } }, "Arrêter");
-    const bJournal = h("button", { type: "button", class: "wpx-btn wpx-vr-jbtn", "aria-pressed": "false", title: "Afficher ou masquer le journal dans une fenêtre à part", onclick: basculerJournal }, "Journal");
-    const bMemoire = h("button", { type: "button", class: "wpx-btn", title: "Effacer le journal et le cache de l'outil pour alléger la page", onclick: viderMemoire }, "Vider la mémoire");
+    const bJournal = h("button", { type: "button", class: "wpx-btn wpx-vr-jbtn", "aria-pressed": "false", title: "Afficher ou masquer le journal", onclick: basculerJournal }, "Journal");
+    const bMemoire = h("button", { type: "button", class: "wpx-btn", title: "Effacer le journal et le cache de l'outil", onclick: viderMemoire }, "Vider la mémoire");
 
     ETAT.panneau = h("section", { class: "wpx-vr-panel" },
       h("div", { class: "wpx-vr-tete" }, ETAT.resume,
@@ -780,14 +686,12 @@
       ETAT.corps,
       ETAT.journal);
     res.before(ETAT.panneau);
-    // le journal déjà écrit pendant la session reste visible
     ETAT.journal.textContent = LOG.length ? texteAffiche() : "";
     setProgres({});
     rafraichirPanneau();
     majBoutonsJournal();
   }
 
-  // le mode d'export qu'Album avait (« liste » ou « cartes »), pour rallumer son bouton en sortant du verrouillage
   function modeAlbum() {
     try { return JSON.parse(localStorage.getItem("wpx.export.mode")) === "cartes" ? "cartes" : "liste"; }
     catch (e) { return "liste"; }
@@ -807,8 +711,6 @@
     if (on) rafraichirPanneau();
   }
 
-  // ---------- Le cadenas, en haut du site (à côté de Clean et Largeur) : seul accès au verrouillage ----------
-  // Un clic ouvre le tiroir directement en mode verrouillage ; un second clic le referme.
   function ouvrirVerrou() {
     let t = $("#wpx-tiroir");
     if (t && t.classList.contains("wpx-ouvert")) {
@@ -829,11 +731,11 @@
   }
 
   function installerBouton() {
-    if (ETAT.bouton && ETAT.bouton.isConnected) return;   // déjà en place : rien à chercher
+    if (ETAT.bouton && ETAT.bouton.isConnected) return;
     const rangee = $("body > header.top .row1");
     if (!rangee) return;
     const existant = rangee.querySelector(".wpx-vr-crane");
-    if (existant) { ETAT.bouton = existant; return; }
+    if (existant) existant.remove();
     const repere = rangee.querySelector(":scope > [data-wpx-reglages]") || rangee.querySelector(":scope > [data-wpx-bascule]");
     const bouton = h("button", { type: "button", class: "wpx-crane wpx-vr-crane", "aria-pressed": "false",
       title: "Verrouiller ou déverrouiller les cartes des étiquettes affichées", "aria-label": "Verrouiller les cartes", onclick: ouvrirVerrou }, SVG_FERME);
@@ -850,15 +752,11 @@
     setTimeout(() => d.remove(), 5000);
   }
 
-  // ---------- Styles ----------
   function installerStyles() {
     if (document.getElementById("wpx-vr-styles")) return;
     const s = h("style", { id: "wpx-vr-styles" }, `
 #wpx-tiroir.wpx-vr-on .wpx-t-res,#wpx-tiroir.wpx-vr-on .wpx-t-options{display:none!important}
 #wpx-tiroir:not(.wpx-vr-on) .wpx-vr-panel{display:none!important}
-.wpx-vr-mode{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 12px;border:1px solid var(--wpx-bord,rgba(167,139,250,.16));border-radius:9px;background:none;color:inherit;font:600 12.5px Inter,system-ui,sans-serif;cursor:pointer}
-.wpx-vr-mode svg{width:14px;height:14px}
-.wpx-vr-mode[aria-pressed="true"],.wpx-vr-jbtn[aria-pressed="true"]{background:var(--wpx-degrade,#7c3aed);border-color:transparent;color:#fff}
 .wpx-vr-panel{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;padding:10px 14px 14px;font:500 13px/1.4 Inter,system-ui,sans-serif;color:var(--wpx-encre,#ece9f6)}
 .wpx-vr-tete{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
 .wpx-vr-tete .wpx-vr-resume{margin-right:auto;color:var(--wpx-doux,#9a93b3);font-size:12.5px}
@@ -866,6 +764,7 @@
 .wpx-vr-tete .wpx-btn svg,.wpx-vr-cat-tete .wpx-btn svg{width:13px;height:13px}
 .wpx-vr-stop{display:none!important}
 .wpx-vr-en .wpx-vr-stop{display:inline-flex!important}
+.wpx-vr-jbtn[aria-pressed="true"]{background:var(--wpx-degrade,#7c3aed);border-color:transparent;color:#fff}
 .wpx-vr-progres{margin:4px 0 10px;padding:9px 10px;border:1px solid var(--wpx-bord,rgba(167,139,250,.16));border-radius:10px;background:rgba(255,255,255,.03)}
 .wpx-vr-progres-tete{display:flex;align-items:center;gap:8px;margin-bottom:7px}
 .wpx-vr-statut{font:800 13px Sora,Inter,sans-serif}
@@ -914,17 +813,15 @@
     document.head.append(s);
   }
 
-  // ---------- Suivi de la page ----------
   function verifier() {
     ETAT.planifie = 0;
     installerBouton();
     const t = $("#wpx-tiroir");
     if (!t) return;
     installerDansTiroir(t);
-    // (2.6) sortie du panneau : autre mode du tiroir, tiroir fermé (bouton ✕, Échap, autre page) → mode coupé et mémoire vidée
     const dedans = t.classList.contains("wpx-ouvert") && t.classList.contains("wpx-vr-on");
     if (ETAT.dedans && !dedans) {
-      if (t.classList.contains("wpx-vr-on")) {               // tiroir fermé en mode verrouillage : il rouvrira sur l'export
+      if (t.classList.contains("wpx-vr-on")) {
         t.classList.remove("wpx-vr-on");
         if (ETAT.bouton) ETAT.bouton.setAttribute("aria-pressed", "false");
       }
@@ -932,9 +829,8 @@
       viderEnQuittant();
       return;
     }
-    if (dedans && !ETAT.dedans) ETAT.aVider = false;         // revenu avant la fin du traitement : on garde tout
+    if (dedans && !ETAT.dedans) ETAT.aVider = false;
     ETAT.dedans = dedans;
-    // la liste n'est recalculée que si le mode verrouillage est affiché et que la sélection a changé
     if (t.classList.contains("wpx-vr-on") && ETAT.panneau) {
       const signature = signatureSelection();
       if (signature !== ETAT.signature) rafraichirPanneau();
@@ -945,15 +841,12 @@
     if (!ETAT.planifie) ETAT.planifie = requestAnimationFrame(verifier);
   }
 
-  // Une mutation est utile si elle ne vient pas du script lui-même.
-  // Les changements d'attributs ne comptent que dans le tiroir (cases cochées, ouverture, mode).
   function mutationUtile(m) {
     const cible = m.target;
     if (cible.nodeType !== 1) return true;
     if (cible.closest(".wpx-vr-panel, #wpx-vr-journal-panel")) return false;
     if (m.type === "attributes") return !!cible.closest("#wpx-tiroir");
     if (cible === document.body) {
-      // ajout ou retrait d'une notification du script seulement : rien à revérifier
       const noeuds = [...m.addedNodes, ...m.removedNodes];
       if (noeuds.length && noeuds.every(n => n.nodeType === 1 && n.classList.contains("wpx-vr-toast"))) return false;
     }
@@ -962,7 +855,7 @@
 
   installerStyles();
   new MutationObserver(mutations => {
-    if (ETAT.planifie) return;   // une vérification est déjà prévue pour la prochaine image
+    if (ETAT.planifie) return;
     for (const m of mutations) {
       if (mutationUtile(m)) { planifier(); return; }
     }
